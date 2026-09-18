@@ -107,7 +107,8 @@ export interface SessionNewResult {
 
 export interface SessionPromptParams {
   sessionId: string;
-  prompt: string;
+  prompt?: string | any[];
+  content?: string | any[];
   userHint?: string;
   maxTokens?: number;
   timeoutMs?: number;
@@ -116,8 +117,10 @@ export interface SessionPromptParams {
 
 export interface SessionPromptResult {
   sessionId: string;
+  stopReason?: 'end_turn' | 'requires_action' | 'cancelled' | 'error' | string;
   status: 'completed' | 'interrupted' | 'error' | 'blocked';
   summary?: string;
+  content?: Array<{ type: string; text: string; [key: string]: any }>;
   metrics?: any;
   _meta?: Record<string, any>;
 }
@@ -189,13 +192,21 @@ export type SessionUpdateType =
   | 'step_delta'
   | 'step_finished'
   | 'milestone_updated'
-  | 'blocked_need_user';
+  | 'blocked_need_user'
+  | 'agent_message_chunk'
+  | 'AgentMessageChunk'
+  | 'agent_thought_chunk'
+  | 'tool_call'
+  | 'tool_call_update';
 
 export interface SessionUpdateNotification {
   sessionId: string;
-  updateType: SessionUpdateType;
+  updateType?: SessionUpdateType | string;
+  sessionUpdate?: string;
   timestamp: number;
-  data: any;
+  data?: any;
+  content?: { type: string; text?: string; [key: string]: any };
+  update?: any;
   _meta?: Record<string, any>;
 }
 

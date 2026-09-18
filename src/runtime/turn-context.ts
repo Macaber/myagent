@@ -28,7 +28,7 @@ export class TurnContext {
     private readonly config: TurnContextConfig,
     private readonly telemetryStore: TelemetryStore,
     private readonly eventStore: EventStore,
-    private readonly dispatcher?: RpcDispatcher
+    public readonly dispatcher?: RpcDispatcher
   ) {
     this.turnId = config.turnId;
     this.threadId = config.threadId;

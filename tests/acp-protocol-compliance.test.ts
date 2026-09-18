@@ -136,6 +136,7 @@ describe('Official ACP Protocol Full Compliance', () => {
     const promptRes = await harness.waitForResponse(11);
     assert.strictEqual(promptRes.result.sessionId, 'sess_stream_test');
     assert.strictEqual(promptRes.result.status, 'completed');
+    assert.strictEqual(promptRes.result.stopReason, 'end_turn');
     assert.ok(promptRes.result.metrics.counts.turns >= 1);
   });
 
@@ -151,5 +152,37 @@ describe('Official ACP Protocol Full Compliance', () => {
 
     const res = await harness.waitForResponse(20);
     assert.strictEqual(res.result.cancelled, false);
+  });
+
+  test('5. session/prompt: Supports content block array and emits agent_message_chunk', async () => {
+    const harness = setupTestHarness();
+
+    harness.sendToAgent({
+      jsonrpc: '2.0',
+      id: 30,
+      method: 'session/new',
+      params: { sessionId: 'sess_blocks_test' },
+    });
+    await harness.waitForResponse(30);
+
+    harness.sendToAgent({
+      jsonrpc: '2.0',
+      id: 31,
+      method: 'session/prompt',
+      params: {
+        sessionId: 'sess_blocks_test',
+        prompt: [{ type: 'text', text: 'Explain the codebase architecture' }],
+      },
+    });
+
+    const chunk = await harness.waitForNotification('session/update', 'agent_message_chunk');
+    assert.strictEqual(chunk.params.sessionId, 'sess_blocks_test');
+    assert.ok(chunk.params.content?.text || chunk.params.data?.text);
+
+    const res = await harness.waitForResponse(31);
+    assert.strictEqual(res.result.sessionId, 'sess_blocks_test');
+    assert.strictEqual(res.result.stopReason, 'end_turn');
+    assert.strictEqual(res.result.status, 'completed');
+    assert.ok(Array.isArray(res.result.content));
   });
 });

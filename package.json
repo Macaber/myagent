@@ -4,6 +4,9 @@
   "description": "Long-running Agent Runtime with ACP protocol, Thread-Turn-Step telemetry, event-sourcing, and OpenAI compatibility",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "myagent": "./dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",

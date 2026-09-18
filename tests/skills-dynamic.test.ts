@@ -95,6 +95,8 @@ Version 1 Prompt`
     const watcher = registry.watchSkillsDirectory(skillsDir, (_action, id) => {
       updatedSkillId = id;
     });
+    // Allow OS watcher to attach
+    await new Promise((r) => setTimeout(r, 100));
 
     try {
       // Modify file
@@ -108,7 +110,7 @@ Version 2 Prompt`
       );
 
       // Wait for fs.watch event to fire and reload
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < 60; i++) {
         if (registry.getSkill('hotreloadskill')?.description === 'Version 2 Updated') {
           break;
         }

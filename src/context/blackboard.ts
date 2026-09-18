@@ -69,6 +69,19 @@ export class Blackboard {
     }
   }
 
+  public delete(key: string): void {
+    if (!this.db) {
+      this.inMemoryEntries.delete(key);
+      return;
+    }
+    const rawDb = this.db.getRawDb();
+    const stmt = rawDb.prepare(`
+      DELETE FROM blackboard_entries
+      WHERE thread_id = ? AND entry_key = ?
+    `);
+    stmt.run(this.threadId, key);
+  }
+
   public listEntries(): Record<string, any> {
     if (!this.db) {
       return Object.fromEntries(this.inMemoryEntries);

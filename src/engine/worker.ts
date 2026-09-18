@@ -1,5 +1,5 @@
 import { OpenAIProvider } from '../provider/openai-provider.js';
-import { ChatMessage } from '../provider/types.js';
+import { ChatMessage, CompletionResult, ToolCallItem, CompletionUsage } from '../provider/types.js';
 import { ToolRegistry, ToolExecutionContext } from '../tools/tool-registry.js';
 import { SkillRegistry } from '../skills/skill-registry.js';
 import { TurnContext } from '../runtime/turn-context.js';
@@ -66,6 +66,20 @@ export class WorkerAgent {
       step.end({ status: 'SUCCESS' });
       milestone.resultSummary = `Milestone '${milestone.title}' executed successfully (offline mode).`;
 
+      // Emit agent_message_chunk so ACP client receives output
+      turnContext.dispatcher?.emitSessionUpdate({
+        sessionId: toolContext.threadId,
+        updateType: 'agent_message_chunk',
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `${milestone.resultSummary}\n` },
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `${milestone.resultSummary}\n` },
+        },
+        data: { text: `${milestone.resultSummary}\n` },
+        timestamp: Date.now(),
+      });
+
       // Lifecycle cleanup & recording
       toolContext.blackboard.recordMilestoneCompletion(milestone.id, milestone.title, milestone.resultSummary);
       this.skillRegistry.clearTurnSkills(turnContext.turnId);
@@ -111,14 +125,62 @@ export class WorkerAgent {
           metadata: { milestoneId: milestone.id },
         });
 
-        let response;
+        let response: CompletionResult;
         try {
-          response = await this.provider.complete({
+          const stream = this.provider.chatStream({
             messages: assembledMessages,
             tools: activeToolSchemas,
             temperature: 0.2,
             abortSignal: toolContext.abortSignal,
           });
+
+          let fullContent = '';
+          const toolCallsMap = new Map<number, { id: string; name: string; args: string }>();
+          let usage: CompletionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+          for await (const chunk of stream) {
+            if (chunk.type === 'content' && chunk.deltaText) {
+              fullContent += chunk.deltaText;
+              turnContext.dispatcher?.emitSessionUpdate({
+                sessionId: toolContext.threadId,
+                updateType: 'agent_message_chunk',
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: chunk.deltaText },
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: chunk.deltaText },
+                },
+                data: { text: chunk.deltaText },
+                timestamp: Date.now(),
+              });
+            } else if (chunk.type === 'tool_call_delta' && chunk.toolCallDelta) {
+              const { index, id, name, argumentsChunk } = chunk.toolCallDelta;
+              const current = toolCallsMap.get(index) ?? { id: '', name: '', args: '' };
+              if (id) current.id = id;
+              if (name) current.name = name;
+              if (argumentsChunk) current.args += argumentsChunk;
+              toolCallsMap.set(index, current);
+            } else if (chunk.type === 'usage' && chunk.usage) {
+              usage = chunk.usage;
+            }
+          }
+
+          const toolCalls: ToolCallItem[] = Array.from(toolCallsMap.entries())
+            .sort(([a], [b]) => a - b)
+            .map(([_, val]) => ({
+              id: val.id || `call_${Date.now()}`,
+              type: 'function',
+              function: {
+                name: val.name,
+                arguments: val.args,
+              },
+            }));
+
+          response = {
+            content: fullContent.length > 0 ? fullContent : null,
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            usage,
+          };
 
           if (response.usage) {
             toolContext.blackboard.recordTokenUsage(response.usage.totalTokens);

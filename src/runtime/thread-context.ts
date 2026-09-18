@@ -19,7 +19,7 @@ export class ThreadContext {
   public readonly threadId: string;
   public readonly sessionId: string;
   public readonly parentThreadId?: string;
-  public readonly prompt: string;
+  public prompt: string;
   public readonly workspaceJail: WorkspaceJail;
   public readonly blackboard: Blackboard;
   public readonly telemetryStore: TelemetryStore;
@@ -129,31 +129,41 @@ export class ThreadContext {
     return this.currentTurn;
   }
 
-  public setExecutionPlan(plan: ExecutionPlan): void {
+  public setPrompt(prompt: string): void {
+    this.prompt = prompt;
+    this.executionPlan = undefined;
+    this.blackboard.delete('__execution_plan__');
+  }
+
+  public setExecutionPlan(plan?: ExecutionPlan): void {
     this.executionPlan = plan;
-    this.blackboard.set('__execution_plan__', plan.toJSON());
+    if (plan) {
+      this.blackboard.set('__execution_plan__', plan.toJSON());
 
-    this.eventStore.appendEvent({
-      threadId: this.threadId,
-      turnId: this.currentTurn?.turnId,
-      eventType: 'PLAN_GENERATED',
-      payload: plan.toJSON(),
-      createdAt: Date.now(),
-    });
+      this.eventStore.appendEvent({
+        threadId: this.threadId,
+        turnId: this.currentTurn?.turnId,
+        eventType: 'PLAN_GENERATED',
+        payload: plan.toJSON(),
+        createdAt: Date.now(),
+      });
 
-    this.dispatcher?.emitSessionUpdate({
-      sessionId: this.threadId,
-      updateType: 'plan_generated',
-      timestamp: Date.now(),
-      data: plan.toJSON(),
-    });
-    this.dispatcher?.emitTaskEvent({
-      threadId: this.threadId,
-      turnId: this.currentTurn?.turnId,
-      type: 'PLAN_GENERATED',
-      timestamp: Date.now(),
-      data: plan.toJSON(),
-    });
+      this.dispatcher?.emitSessionUpdate({
+        sessionId: this.threadId,
+        updateType: 'plan_generated',
+        timestamp: Date.now(),
+        data: plan.toJSON(),
+      });
+      this.dispatcher?.emitTaskEvent({
+        threadId: this.threadId,
+        turnId: this.currentTurn?.turnId,
+        type: 'PLAN_GENERATED',
+        timestamp: Date.now(),
+        data: plan.toJSON(),
+      });
+    } else {
+      this.blackboard.delete('__execution_plan__');
+    }
   }
 
   public getExecutionPlan(): ExecutionPlan | undefined {

@@ -1,4 +1,8 @@
+#!/usr/bin/env node
 import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { AgentDatabase } from './persistence/db.js';
 import { AcpTransport } from './protocol/transport.js';
 import { StdioTransport } from './protocol/stdio-transport.js';
@@ -61,8 +65,81 @@ export interface AgentRuntimeOptions {
   httpPort?: number;
   httpHost?: string;
   provider?: OpenAIProvider;
+  autoDiscoverProvider?: boolean;
   autoScanSkills?: boolean;
   autoLoadMcp?: boolean;
+}
+
+export function extractPromptText(raw: any): string {
+  if (typeof raw === 'string') return raw;
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          return item.text || item.content || item.value || '';
+        }
+        return String(item || '');
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (raw && typeof raw === 'object') {
+    return raw.text || raw.content || raw.value || JSON.stringify(raw);
+  }
+  return String(raw || '');
+}
+
+export function resolveDefaultProvider(root: string): OpenAIProvider | undefined {
+  if (process.env.OPENAI_API_KEY) {
+    return new OpenAIProvider({
+      apiKey: process.env.OPENAI_API_KEY,
+      baseUrl: process.env.OPENAI_BASE_URL,
+      model: process.env.OPENAI_MODEL,
+    });
+  }
+
+  // 1. Try loading .env from root or ~/.agent/.env
+  try {
+    const cwdEnv = path.join(root, '.env');
+    if (fs.existsSync(cwdEnv) && typeof (process as any).loadEnvFile === 'function') {
+      (process as any).loadEnvFile(cwdEnv);
+    }
+    const homeAgentEnv = path.join(os.homedir(), '.agent', '.env');
+    if (fs.existsSync(homeAgentEnv) && typeof (process as any).loadEnvFile === 'function') {
+      (process as any).loadEnvFile(homeAgentEnv);
+    }
+  } catch {}
+
+  if (process.env.OPENAI_API_KEY) {
+    return new OpenAIProvider({
+      apiKey: process.env.OPENAI_API_KEY,
+      baseUrl: process.env.OPENAI_BASE_URL,
+      model: process.env.OPENAI_MODEL,
+    });
+  }
+
+  // 2. Try loading from ~/.pi/agent/auth.json
+  try {
+    const authPath = path.join(os.homedir(), '.pi', 'agent', 'auth.json');
+    if (fs.existsSync(authPath)) {
+      const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+      if (auth.deepseek?.key) {
+        return new OpenAIProvider({
+          apiKey: auth.deepseek.key,
+          baseUrl: 'https://api.deepseek.com',
+          model: 'deepseek-chat',
+        });
+      }
+      if (auth.openai?.key) {
+        return new OpenAIProvider({
+          apiKey: auth.openai.key,
+        });
+      }
+    }
+  } catch {}
+
+  return undefined;
 }
 
 export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
@@ -123,7 +200,18 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   if (options.autoLoadMcp !== false) {
     mcpManager.loadConfigFile(path.join(root, '.agent', 'mcp.json')).catch(() => {});
   }
-  const provider = options.provider || (process.env.OPENAI_API_KEY ? new OpenAIProvider() : undefined);
+  let provider = options.provider;
+  if (!provider) {
+    if (process.env.OPENAI_API_KEY) {
+      provider = new OpenAIProvider({
+        apiKey: process.env.OPENAI_API_KEY,
+        baseUrl: process.env.OPENAI_BASE_URL,
+        model: process.env.OPENAI_MODEL,
+      });
+    } else if (options.autoDiscoverProvider) {
+      provider = resolveDefaultProvider(root);
+    }
+  }
 
   const verificationGuard = new VerificationGuard(toolRegistry);
   const toolRouter = new ToolRouter(toolRegistry);
@@ -187,19 +275,24 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/prompt
   dispatcher.registerMethod<SessionPromptParams, SessionPromptResult>('session/prompt', async (params) => {
+    const rawPrompt = params.prompt ?? params.content;
+    const promptText = extractPromptText(rawPrompt);
+
     let thread = activeThreads.get(params.sessionId);
     if (!thread) {
       thread = new ThreadContext(
         {
           threadId: params.sessionId,
           sessionId: params.sessionId,
-          prompt: params.prompt,
+          prompt: promptText,
           workspacePath: root,
         },
         db,
         dispatcher
       );
       activeThreads.set(params.sessionId, thread);
+    } else {
+      thread.setPrompt(promptText);
     }
 
     const abortController = new AbortController();
@@ -211,10 +304,26 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         abortSignal: abortController.signal,
       });
 
+      const summaryText =
+        report.status === 'COMPLETED'
+          ? 'Task completed successfully'
+          : report.status === 'SUSPENDED_INPUT'
+          ? 'Execution blocked: requires user input'
+          : `Execution failed: ${report.status}`;
+
+      const stopReason =
+        report.status === 'COMPLETED'
+          ? 'end_turn'
+          : report.status === 'SUSPENDED_INPUT'
+          ? 'requires_action'
+          : 'error';
+
       return {
         sessionId: params.sessionId,
+        stopReason,
         status: report.status === 'COMPLETED' ? 'completed' : report.status === 'SUSPENDED_INPUT' ? 'blocked' : 'error',
-        summary: report.status === 'COMPLETED' ? 'Task completed successfully' : `Status: ${report.status}`,
+        summary: summaryText,
+        content: [{ type: 'text', text: summaryText }],
         metrics: report,
       };
     } finally {
@@ -371,8 +480,19 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   };
 }
 
+function isDirectExecution(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    const entryPath = fs.realpathSync(process.argv[1]);
+    const selfPath = fs.realpathSync(fileURLToPath(import.meta.url));
+    return entryPath === selfPath;
+  } catch {
+    return false;
+  }
+}
+
 // Direct CLI Execution
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isDirectExecution()) {
   const args = process.argv.slice(2);
   let mode: 'stdio' | 'http' | 'dual' = 'stdio';
   let port = 3000;
@@ -384,17 +504,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     if (arg.startsWith('--port=')) port = parseInt(arg.split('=')[1], 10);
   }
 
-  console.log(`[MyAgent] Starting Agent Runtime (mode: ${mode}, port: ${port})...`);
+  // Write status to stderr so stdout remains 100% clean JSON-RPC for ACP stdio clients
+  console.error(`[MyAgent] Starting Agent Runtime (mode: ${mode}, port: ${port})...`);
   const runtime = createAgentRuntime({
     workspaceRoot: process.cwd(),
     dbPath: path.join(process.cwd(), '.agent', 'data.db'),
     transportMode: mode,
     httpPort: port,
+    autoDiscoverProvider: true,
   });
 
   if (runtime.httpTransport) {
     runtime.httpTransport.start().then((actualPort) => {
-      console.log(`[MyAgent] HTTP JSON-RPC & SSE server listening at http://127.0.0.1:${actualPort}`);
+      console.error(`[MyAgent] HTTP JSON-RPC & SSE server listening at http://127.0.0.1:${actualPort}`);
     });
   }
 }

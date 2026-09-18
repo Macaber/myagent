@@ -25,10 +25,14 @@ export class StdioTransport implements AcpTransport {
 
   public send(message: JsonRpcRequest | JsonRpcResponse | JsonRpcNotification): void {
     if (this.isClosed) {
-      throw new Error('Cannot send message on closed StdioTransport');
+      return;
     }
     const payload = JSON.stringify(message) + '\n';
-    this.output.write(payload);
+    try {
+      this.output.write(payload);
+    } catch {
+      this.isClosed = true;
+    }
   }
 
   public close(): void {
@@ -43,7 +47,7 @@ export class StdioTransport implements AcpTransport {
   private setupInputListener(): void {
     if (this.input === process.stdin) {
       try {
-        process.stdin.unref?.();
+        process.stdin.resume?.();
       } catch {}
     }
     this.input.setEncoding('utf8');
