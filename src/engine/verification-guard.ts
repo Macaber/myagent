@@ -50,7 +50,7 @@ export class VerificationGuard {
     }
 
     // Otherwise, check if resultSummary was produced
-    if (milestone.resultSummary && milestone.resultSummary.length > 20) {
+    if (milestone.resultSummary && milestone.resultSummary.trim().length > 0) {
       return {
         passed: true,
         message: `Milestone verified with criteria "${criteria}": ${milestone.resultSummary.slice(0, 200)}`,

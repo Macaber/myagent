@@ -13,7 +13,8 @@
     "start": "node dist/index.js",
     "dev": "node --no-warnings dist/index.js",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "task": "node --experimental-strip-types scripts/run-task.ts"
+    "task": "node --experimental-strip-types scripts/run-task.ts",
+    "tui": "node dist/tui/index.js"
   },
   "keywords": [
     "agent",
@@ -26,10 +27,16 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "ink": "^7.1.1",
+    "ink-select-input": "^6.2.0",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.3.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "@types/react": "^19.3.0",
     "typescript": "^5.7.2"
   },
   "engines": {

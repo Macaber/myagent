@@ -107,9 +107,13 @@ export class WorkerAgent {
         }
 
         // Dynamically get active tools and minimal assembled context
-        const activeToolSchemas = this.toolRouter.getActiveToolSchemas(turnContext.turnId, 'worker');
+        const isConversational = milestone.title === 'Direct Conversational Response';
+        const activeToolSchemas = isConversational
+          ? undefined
+          : this.toolRouter.getActiveToolSchemas(turnContext.turnId, 'worker');
+
         const assembledMessages = this.contextAssembler.assemble({
-          threadPrompt: toolContext.threadId,
+          threadPrompt: toolContext.prompt || toolContext.threadId,
           turnId: turnContext.turnId,
           stage: 'worker',
           currentMilestoneTitle: milestone.title,
@@ -139,7 +143,20 @@ export class WorkerAgent {
           let usage: CompletionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
           for await (const chunk of stream) {
-            if (chunk.type === 'content' && chunk.deltaText) {
+            if (chunk.type === 'thought' && chunk.thoughtText) {
+              turnContext.dispatcher?.emitSessionUpdate({
+                sessionId: toolContext.threadId,
+                updateType: 'agent_thought_chunk',
+                sessionUpdate: 'agent_thought_chunk',
+                content: { type: 'text', text: chunk.thoughtText },
+                update: {
+                  sessionUpdate: 'agent_thought_chunk',
+                  content: { type: 'text', text: chunk.thoughtText },
+                },
+                data: { text: chunk.thoughtText },
+                timestamp: Date.now(),
+              });
+            } else if (chunk.type === 'content' && chunk.deltaText) {
               fullContent += chunk.deltaText;
               turnContext.dispatcher?.emitSessionUpdate({
                 sessionId: toolContext.threadId,
@@ -222,6 +239,24 @@ export class WorkerAgent {
               parsedArgs = {};
             }
 
+            const toolCallId = tc.id || `call_${Date.now()}`;
+
+            // Emit tool_call start update for Zed UI
+            turnContext.dispatcher?.emitSessionUpdate({
+              sessionId: toolContext.threadId,
+              updateType: 'tool_call',
+              sessionUpdate: 'tool_call',
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId,
+                title: toolName,
+                kind: toolName === 'read' || toolName === 'grep' || toolName === 'glob' ? 'read' : toolName === 'edit' || toolName === 'write' ? 'edit' : toolName === 'bash' ? 'execute' : 'other',
+                status: 'in_progress',
+                rawInput: parsedArgs,
+              },
+              timestamp: Date.now(),
+            });
+
             // Step: Tool Execution
             const toolStep = turnContext.createStep({
               stepType: 'TOOL_EXECUTION',
@@ -241,6 +276,22 @@ export class WorkerAgent {
 
             const hasError = !!executionResult.error;
             loopDetector.recordAction(toolName, parsedArgs, hasError);
+
+            // Emit tool_call_update for Zed UI
+            const toolOutputText = executionResult.output || executionResult.error || '';
+            turnContext.dispatcher?.emitSessionUpdate({
+              sessionId: toolContext.threadId,
+              updateType: 'tool_call_update',
+              sessionUpdate: 'tool_call_update',
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId,
+                status: hasError ? 'failed' : 'completed',
+                content: [{ type: 'content', content: { type: 'text', text: toolOutputText.slice(0, 2000) } }],
+                rawOutput: toolOutputText,
+              },
+              timestamp: Date.now(),
+            });
 
             toolStep.end({
               status: hasError ? 'FAILED' : 'SUCCESS',

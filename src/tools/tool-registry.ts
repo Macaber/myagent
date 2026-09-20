@@ -7,6 +7,7 @@ import { Blackboard } from '../context/blackboard.js';
 
 export interface ToolExecutionContext {
   threadId: string;
+  prompt?: string;
   turnId?: string;
   stepId?: string;
   workspaceJail: WorkspaceJail;

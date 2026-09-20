@@ -126,6 +126,118 @@ export class AgentDatabase {
         diff_content TEXT,
         created_at INTEGER NOT NULL
       );
+
+      -- 7. ACP Sessions
+      CREATE TABLE IF NOT EXISTS acp_sessions (
+        session_id TEXT PRIMARY KEY,
+        cwd TEXT NOT NULL,
+        title TEXT,
+        additional_directories TEXT,
+        current_mode_id TEXT,
+        config_options TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted INTEGER DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_acp_sessions_cwd ON acp_sessions(cwd);
     `);
   }
+
+  public saveAcpSession(session: {
+    sessionId: string;
+    cwd: string;
+    title?: string | null;
+    additionalDirectories?: string[];
+    currentModeId?: string;
+    configOptions?: any[];
+    createdAt?: number;
+    updatedAt?: number;
+    deleted?: boolean;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO acp_sessions (session_id, cwd, title, additional_directories, current_mode_id, config_options, created_at, updated_at, deleted)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        cwd = excluded.cwd,
+        title = excluded.title,
+        additional_directories = excluded.additional_directories,
+        current_mode_id = excluded.current_mode_id,
+        config_options = excluded.config_options,
+        updated_at = excluded.updated_at,
+        deleted = excluded.deleted
+    `);
+    stmt.run(
+      session.sessionId,
+      session.cwd,
+      session.title ?? null,
+      JSON.stringify(session.additionalDirectories || []),
+      session.currentModeId ?? 'code',
+      JSON.stringify(session.configOptions || []),
+      session.createdAt || Date.now(),
+      session.updatedAt || Date.now(),
+      session.deleted ? 1 : 0
+    );
+  }
+
+  public getAcpSession(sessionId: string): any | undefined {
+    const stmt = this.db.prepare(`SELECT * FROM acp_sessions WHERE session_id = ? AND deleted = 0`);
+    const row = stmt.get(sessionId) as any;
+    if (!row) return undefined;
+    return {
+      sessionId: row.session_id,
+      cwd: row.cwd,
+      title: row.title,
+      additionalDirectories: row.additional_directories ? JSON.parse(row.additional_directories) : [],
+      currentModeId: row.current_mode_id,
+      configOptions: row.config_options ? JSON.parse(row.config_options) : [],
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      deleted: Boolean(row.deleted),
+    };
+  }
+
+  public listAcpSessions(cwd?: string, limit: number = 50, cursor?: string): { sessions: any[]; nextCursor?: string } {
+    let query = `SELECT * FROM acp_sessions WHERE deleted = 0`;
+    const params: any[] = [];
+    if (cwd) {
+      query += ` AND cwd = ?`;
+      params.push(cwd);
+    }
+    if (cursor) {
+      const cursorTime = parseInt(cursor, 10);
+      if (!isNaN(cursorTime)) {
+        query += ` AND updated_at < ?`;
+        params.push(cursorTime);
+      }
+    }
+    query += ` ORDER BY updated_at DESC LIMIT ?`;
+    params.push(limit + 1);
+
+    const stmt = this.db.prepare(query);
+    const rows = stmt.all(...params) as any[];
+
+    let nextCursor: string | undefined;
+    if (rows.length > limit) {
+      const last = rows[limit - 1];
+      nextCursor = String(last.updated_at);
+      rows.splice(limit);
+    }
+
+    return {
+      sessions: rows.map((r) => ({
+        sessionId: r.session_id,
+        cwd: r.cwd,
+        title: r.title,
+        createdAt: new Date(r.created_at).toISOString(),
+        updatedAt: new Date(r.updated_at).toISOString(),
+      })),
+      nextCursor,
+    };
+  }
+
+  public deleteAcpSession(sessionId: string): void {
+    const stmt = this.db.prepare(`UPDATE acp_sessions SET deleted = 1, updated_at = ? WHERE session_id = ?`);
+    stmt.run(Date.now(), sessionId);
+  }
 }
+

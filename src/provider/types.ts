@@ -33,8 +33,9 @@ export interface CompletionUsage {
 }
 
 export interface StreamDeltaChunk {
-  type: 'content' | 'tool_call_delta' | 'usage' | 'done';
+  type: 'content' | 'thought' | 'tool_call_delta' | 'usage' | 'done';
   deltaText?: string;
+  thoughtText?: string;
   toolCallDelta?: {
     index: number;
     id?: string;

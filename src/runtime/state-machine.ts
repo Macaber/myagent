@@ -10,7 +10,7 @@ export type TaskState =
   | 'CANCELLED';
 
 const VALID_TRANSITIONS: Record<TaskState, TaskState[]> = {
-  PENDING: ['PLANNING', 'CANCELLED', 'FAILED'],
+  PENDING: ['PLANNING', 'RUNNING', 'CANCELLED', 'FAILED'],
   PLANNING: ['RUNNING', 'FAILED', 'CANCELLED', 'SUSPENDED_INPUT'],
   RUNNING: [
     'RUNNING', // self-transition allowed during multi-turn milestone transitions
@@ -23,10 +23,10 @@ const VALID_TRANSITIONS: Record<TaskState, TaskState[]> = {
   ],
   SUSPENDED_APPROVAL: ['RUNNING', 'FAILED', 'CANCELLED'],
   SUSPENDED_INPUT: ['RUNNING', 'FAILED', 'CANCELLED'],
-  PAUSED: ['RUNNING', 'CANCELLED'],
-  COMPLETED: [],
-  FAILED: ['PLANNING', 'RUNNING'], // allowed when user triggers retry
-  CANCELLED: [],
+  PAUSED: ['RUNNING', 'CANCELLED', 'PLANNING'],
+  COMPLETED: ['PLANNING', 'RUNNING', 'PENDING'],
+  FAILED: ['PLANNING', 'RUNNING', 'PENDING'], // allowed when user triggers retry or new prompt
+  CANCELLED: ['PLANNING', 'RUNNING', 'PENDING'],
 };
 
 export class TaskStateMachine {

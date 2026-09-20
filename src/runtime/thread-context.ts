@@ -133,6 +133,7 @@ export class ThreadContext {
     this.prompt = prompt;
     this.executionPlan = undefined;
     this.blackboard.delete('__execution_plan__');
+    this.setState('PENDING');
   }
 
   public setExecutionPlan(plan?: ExecutionPlan): void {
@@ -148,9 +149,25 @@ export class ThreadContext {
         createdAt: Date.now(),
       });
 
+      const entries = plan.getMilestones().map((m) => ({
+        content: m.title + (m.description ? `: ${m.description}` : ''),
+        priority: 'medium' as const,
+        status:
+          m.status === 'SUCCESS'
+            ? ('completed' as const)
+            : m.status === 'RUNNING'
+            ? ('in_progress' as const)
+            : ('pending' as const),
+      }));
+
       this.dispatcher?.emitSessionUpdate({
         sessionId: this.threadId,
         updateType: 'plan_generated',
+        sessionUpdate: 'plan',
+        update: {
+          sessionUpdate: 'plan',
+          entries,
+        },
         timestamp: Date.now(),
         data: plan.toJSON(),
       });

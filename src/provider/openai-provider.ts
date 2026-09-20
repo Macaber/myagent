@@ -22,6 +22,10 @@ export class OpenAIProvider {
     this.maxRetries = config.maxRetries ?? 3;
   }
 
+  public getModel(): string {
+    return this.model;
+  }
+
   public async *chatStream(params: {
     messages: ChatMessage[];
     tools?: ToolSchema[];

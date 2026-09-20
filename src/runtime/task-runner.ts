@@ -94,6 +94,7 @@ export class TaskRunner {
         workerTurn,
         {
           threadId: threadContext.threadId,
+          prompt: threadContext.prompt,
           turnId: workerTurn.turnId,
           workspaceJail: threadContext.workspaceJail,
           blackboard: threadContext.blackboard,

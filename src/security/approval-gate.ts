@@ -63,15 +63,46 @@ export class ApprovalGate {
 
     // 4. Send official canonical session/request_permission over ACP
     const requestId = `perm_req_${this.requestIdCounter++}`;
+    const toolCallId = params.stepId || requestId;
     const requestPayload: SessionRequestPermissionParams = {
       sessionId: params.threadId,
+      toolCallId,
       requestId,
       turnId: params.turnId,
       stepId: params.stepId,
       toolCall: {
+        toolCallId,
         name: params.toolName,
+        title: `Execute tool '${params.toolName}'`,
         arguments: params.metadata || {},
+        rawInput: params.metadata || {},
+        content: [
+          {
+            type: 'content',
+            content: {
+              type: 'text',
+              text: `${params.description} (Reason: ${evaluation.reason || 'High risk operation'})`,
+            },
+          },
+        ],
       },
+      options: [
+        {
+          optionId: 'allow_once',
+          name: 'Allow Once',
+          kind: 'allow_once',
+        },
+        {
+          optionId: 'allow_always',
+          name: 'Always Allow',
+          kind: 'allow_always',
+        },
+        {
+          optionId: 'reject_once',
+          name: 'Reject',
+          kind: 'reject_once',
+        },
+      ],
       riskLevel: params.riskLevel,
       description: `${params.description} (Reason: ${evaluation.reason || 'High risk operation'})`,
     };
@@ -81,12 +112,22 @@ export class ApprovalGate {
       SessionRequestPermissionResult
     >('session/request_permission', requestPayload);
 
-    const decisionLower = String(response.decision || '').toLowerCase();
-    if (decisionLower === 'rejected') {
-      throw new PermissionDeniedByUserError(params.toolName, response.reason);
+    const outcome =
+      (response.outcome && 'optionId' in response.outcome
+        ? response.outcome.optionId
+        : response.outcome?.outcome) ||
+      response.decision ||
+      '';
+    const decisionLower = String(outcome).toLowerCase();
+
+    if (decisionLower.includes('reject') || decisionLower.includes('cancel')) {
+      throw new PermissionDeniedByUserError(
+        params.toolName,
+        response.reason || 'Operation rejected by user'
+      );
     }
 
-    if (decisionLower === 'approved_always') {
+    if (decisionLower.includes('always')) {
       this.alwaysApprovedTools.add(params.toolName);
     }
   }

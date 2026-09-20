@@ -41,6 +41,64 @@ import { ThreadContext } from './runtime/thread-context.js';
 import { SubagentManager } from './runtime/subagent-manager.js';
 import { createInvokeSubagentTool } from './tools/subagent-tool.js';
 import {
+  ACP_ERROR_CODES,
+  InitializeRequest,
+  InitializeResponse,
+  AuthenticateRequest,
+  AuthenticateResponse,
+  LogoutRequest,
+  LogoutResponse,
+  NewSessionRequest,
+  NewSessionResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
+  ResumeSessionRequest,
+  ResumeSessionResponse,
+  ListSessionsRequest,
+  ListSessionsResponse,
+  CloseSessionRequest,
+  CloseSessionResponse,
+  DeleteSessionRequest,
+  DeleteSessionResponse,
+  PromptRequest,
+  PromptResponse,
+  SetSessionModeRequest,
+  SetSessionModeResponse,
+  SetSessionConfigOptionRequest,
+  SetSessionConfigOptionResponse,
+  CancelNotification,
+  SessionMode,
+  SessionModeState,
+  SessionConfigOption,
+  SessionInfo,
+  SessionUpdate,
+  UserMessageChunkUpdate,
+  AgentMessageChunkUpdate,
+  UsageNotificationUpdate,
+  McpServer,
+  StopReason,
+  ContentBlock,
+  ClientCapabilities,
+  ClientInfo,
+  AvailableCommand,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+  ReadTextFileRequest,
+  ReadTextFileResponse,
+  WriteTextFileRequest,
+  WriteTextFileResponse,
+  CreateTerminalRequest,
+  CreateTerminalResponse,
+  TerminalOutputRequest,
+  TerminalOutputResponse,
+  WaitForTerminalExitRequest,
+  WaitForTerminalExitResponse,
+  KillTerminalRequest,
+  KillTerminalResponse,
+  ReleaseTerminalRequest,
+  ReleaseTerminalResponse,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   InitializeParams,
   InitializeResult,
   SessionNewParams,
@@ -56,6 +114,76 @@ import {
   TaskResumeParams,
   TaskResumeResult,
 } from './protocol/types.js';
+
+export const DEFAULT_AVAILABLE_COMMANDS: AvailableCommand[] = [
+  { name: 'help', description: 'Show available commands and runtime tips' },
+  { name: 'mode', description: 'Switch execution mode (code, ask, architect)' },
+  { name: 'clear', description: 'Clear context or reset session state' },
+  { name: 'plan', description: 'View current execution plan and milestones' },
+];
+
+export const DEFAULT_MODES: SessionMode[] = [
+  { id: 'code', name: 'Code', description: 'Write and modify code with full tool access' },
+  { id: 'ask', name: 'Ask', description: 'Request permission before making any changes' },
+  { id: 'architect', name: 'Architect', description: 'Design and plan systems without implementation' },
+];
+
+export function createDefaultConfigOptions(supportsBoolean: boolean): SessionConfigOption[] {
+  const options: SessionConfigOption[] = [
+    {
+      type: 'select',
+      id: 'mode',
+      name: 'Session Mode',
+      description: 'Controls how the agent requests permission',
+      category: 'mode',
+      currentValue: 'code',
+      options: [
+        { value: 'code', name: 'Code', description: 'Write and modify code with full tool access' },
+        { value: 'ask', name: 'Ask', description: 'Request permission before making any changes' },
+        { value: 'architect', name: 'Architect', description: 'Design and plan systems without implementation' },
+      ],
+    },
+    {
+      type: 'select',
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      currentValue: 'default',
+      options: [
+        { value: 'default', name: 'Default Model', description: 'The configured default LLM' },
+      ],
+    },
+  ];
+
+  if (supportsBoolean) {
+    options.push({
+      type: 'boolean',
+      id: 'auto_approve',
+      name: 'Auto Approve',
+      description: 'Skip manual confirmation for read-only actions',
+      category: '_approval',
+      currentValue: false,
+    });
+  }
+
+  return options;
+}
+
+export interface StoredSession {
+  sessionId: string;
+  cwd: string;
+  additionalDirectories: string[];
+  title: string | null;
+  createdAt: string;
+  updatedAt: string;
+  currentModeId: string;
+  configOptions: SessionConfigOption[];
+  mcpServers: McpServer[];
+  history: SessionUpdate[];
+  thread: ThreadContext;
+  deleted: boolean;
+  closed: boolean;
+}
 
 export interface AgentRuntimeOptions {
   workspaceRoot?: string;
@@ -88,6 +216,16 @@ export function extractPromptText(raw: any): string {
     return raw.text || raw.content || raw.value || JSON.stringify(raw);
   }
   return String(raw || '');
+}
+
+export function toEnvRecord(env: any): Record<string, string> | undefined {
+  if (Array.isArray(env)) {
+    return Object.fromEntries(env.map((e: any) => [e.name, e.value]));
+  }
+  if (env && typeof env === 'object') {
+    return env as Record<string, string>;
+  }
+  return undefined;
 }
 
 export function resolveDefaultProvider(root: string): OpenAIProvider | undefined {
@@ -220,8 +358,12 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   const worker = new WorkerAgent(provider, toolRegistry, skillRegistry, verificationGuard, toolRouter, contextAssembler);
   const runner = new TaskRunner(planner, worker, toolRegistry);
 
+  const sessions = new Map<string, StoredSession>();
   const activeThreads = new Map<string, ThreadContext>();
   const sessionAbortControllers = new Map<string, AbortController>();
+  let clientCapabilities: ClientCapabilities = {};
+  let clientInfo: ClientInfo | null | undefined = undefined;
+  let authenticated: boolean = false;
 
   // Register Subagent Manager & Tool
   const subagentManager = new SubagentManager(db, worker, toolRegistry, skillRegistry, dispatcher);
@@ -233,9 +375,17 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   // =========================================================================
 
   // ACP: initialize
-  dispatcher.registerMethod<InitializeParams, InitializeResult>('initialize', async (params) => {
+  dispatcher.registerMethod<InitializeRequest, InitializeResponse>('initialize', async (params) => {
+    let version: any = 1;
+    if (params?.protocolVersion !== undefined) {
+      version = params.protocolVersion;
+    }
+
+    clientCapabilities = params?.clientCapabilities || {};
+    clientInfo = params?.clientInfo;
+
     return {
-      protocolVersion: '2024-11-05',
+      protocolVersion: version,
       agentInfo: { name: 'MyAgent-Runtime', version: '0.1.0' },
       agentCapabilities: {
         loadSession: true,
@@ -250,59 +400,458 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         tools: toolRegistry.getAllTools().map((t) => t.name),
         skills: skillRegistry.listSkills().map((s) => s.id),
       },
+      authMethods: [
+        { id: 'token', name: 'API Token', description: 'Authenticate using OpenAI or DeepSeek API key' },
+      ],
     };
   });
 
+  // ACP: authenticate
+  dispatcher.registerMethod<AuthenticateRequest, AuthenticateResponse>('authenticate', async (params) => {
+    if (!params || !params.methodId) {
+      throw { code: ACP_ERROR_CODES.INVALID_PARAMS, message: 'Missing methodId' };
+    }
+    if (params.data?.token || params.data?.apiKey) {
+      const apiKey = params.data.token || params.data.apiKey;
+      provider = new OpenAIProvider({
+        apiKey,
+        baseUrl: params.data.baseUrl,
+        model: params.data.model,
+      });
+    }
+    authenticated = true;
+    return { success: true };
+  });
+
+  // ACP: logout
+  dispatcher.registerMethod<LogoutRequest, LogoutResponse>('logout', async () => {
+    authenticated = false;
+    return { success: true };
+  });
+
+  let nextSessionSeq = 1;
+
   // ACP: session/new
-  dispatcher.registerMethod<SessionNewParams, SessionNewResult>('session/new', async (params) => {
-    const sessionId = params.sessionId || `session_${Date.now()}`;
-    const workspace = (params.roots && params.roots[0]) || params.workspacePath || root;
+  dispatcher.registerMethod<NewSessionRequest, NewSessionResponse>('session/new', async (params) => {
+    const sessionId = (params as any)?.sessionId || `session_${Date.now()}_${nextSessionSeq++}`;
+    const cwd = params?.cwd || (params as any)?.workspacePath || ((params as any)?.roots && (params as any)?.roots[0]) || root;
+    const additionalDirectories = params?.additionalDirectories || [];
+    const mcpServers = params?.mcpServers || [];
+
+    // Mount MCP servers if provided in params
+    if (mcpServers.length > 0) {
+      for (const server of mcpServers) {
+        if ('command' in server) {
+          await mcpManager.mountServer({
+            id: server.name,
+            name: server.name,
+            transport: 'stdio',
+            command: server.command,
+            args: server.args,
+            env: toEnvRecord(server.env),
+          }).catch(() => {});
+        }
+      }
+    }
+
+    const supportsBoolean = Boolean(
+      clientCapabilities?.session?.configOptions?.boolean || (clientCapabilities as any)?.configOptions?.boolean
+    );
+    const configOptions = createDefaultConfigOptions(supportsBoolean);
+    const currentModeId = 'code';
 
     const thread = new ThreadContext(
       {
         threadId: sessionId,
         sessionId,
-        prompt: params.systemPrompt || 'Session initialized',
-        workspacePath: path.resolve(workspace),
+        prompt: (params as any)?.systemPrompt || 'Session initialized',
+        workspacePath: path.resolve(cwd),
       },
       db,
       dispatcher
     );
 
+    const storedSession: StoredSession = {
+      sessionId,
+      cwd: path.resolve(cwd),
+      additionalDirectories,
+      title: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      currentModeId,
+      configOptions,
+      mcpServers,
+      history: [],
+      thread,
+      deleted: false,
+      closed: false,
+    };
+
+    sessions.set(sessionId, storedSession);
     activeThreads.set(sessionId, thread);
-    return { sessionId };
+
+    db.saveAcpSession({
+      sessionId,
+      cwd: storedSession.cwd,
+      title: storedSession.title,
+      additionalDirectories,
+      currentModeId,
+      configOptions,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    // Emit available_commands_update per ACP specification
+    dispatcher.emitSessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: 'available_commands_update',
+        availableCommands: DEFAULT_AVAILABLE_COMMANDS,
+      },
+    });
+
+    return {
+      sessionId,
+      modes: {
+        currentModeId,
+        availableModes: DEFAULT_MODES,
+      },
+      configOptions,
+    };
   });
 
-  // ACP: session/prompt
-  dispatcher.registerMethod<SessionPromptParams, SessionPromptResult>('session/prompt', async (params) => {
-    const rawPrompt = params.prompt ?? params.content;
-    const promptText = extractPromptText(rawPrompt);
-
-    let thread = activeThreads.get(params.sessionId);
-    if (!thread) {
-      thread = new ThreadContext(
+  // ACP: session/load
+  dispatcher.registerMethod<LoadSessionRequest, LoadSessionResponse>('session/load', async (params) => {
+    let session = sessions.get(params.sessionId);
+    if (!session) {
+      const fromDb = db.getAcpSession(params.sessionId);
+      if (!fromDb) {
+        const err: any = new Error(`Session '${params.sessionId}' not found`);
+        err.code = ACP_ERROR_CODES.RESOURCE_NOT_FOUND;
+        throw err;
+      }
+      const thread = new ThreadContext(
         {
-          threadId: params.sessionId,
-          sessionId: params.sessionId,
-          prompt: promptText,
-          workspacePath: root,
+          threadId: fromDb.sessionId,
+          sessionId: fromDb.sessionId,
+          prompt: 'Session loaded',
+          workspacePath: path.resolve(fromDb.cwd),
         },
         db,
         dispatcher
       );
+      session = {
+        sessionId: fromDb.sessionId,
+        cwd: fromDb.cwd,
+        additionalDirectories: fromDb.additionalDirectories,
+        title: fromDb.title,
+        createdAt: new Date(fromDb.createdAt).toISOString(),
+        updatedAt: new Date(fromDb.updatedAt).toISOString(),
+        currentModeId: fromDb.currentModeId || 'code',
+        configOptions: fromDb.configOptions || createDefaultConfigOptions(true),
+        mcpServers: [],
+        history: [],
+        thread,
+        deleted: false,
+        closed: false,
+      };
+      sessions.set(params.sessionId, session);
       activeThreads.set(params.sessionId, thread);
-    } else {
-      thread.setPrompt(promptText);
     }
+
+    if (session.deleted) {
+      const err: any = new Error(`Session '${params.sessionId}' not found`);
+      err.code = ACP_ERROR_CODES.RESOURCE_NOT_FOUND;
+      throw err;
+    }
+
+    if (params.cwd) session.cwd = path.resolve(params.cwd);
+    if (params.additionalDirectories) session.additionalDirectories = params.additionalDirectories;
+    if (params.mcpServers) {
+      session.mcpServers = params.mcpServers;
+      for (const server of params.mcpServers) {
+        if ('command' in server) {
+          await mcpManager.mountServer({
+            id: server.name,
+            name: server.name,
+            transport: 'stdio',
+            command: server.command,
+            args: server.args,
+            env: toEnvRecord(server.env),
+          }).catch(() => {});
+        }
+      }
+    }
+
+    // Replay conversation history via session/update notifications so the client reconstructs the conversation!
+    for (const histUpdate of session.history) {
+      dispatcher.emitSessionUpdate({
+        sessionId: session.sessionId,
+        update: histUpdate,
+      });
+    }
+
+    // Legacy support for targetMilestoneId / userHint
+    if ((params as any)?.targetMilestoneId || (params as any)?.userHint) {
+      const abortController = new AbortController();
+      sessionAbortControllers.set(params.sessionId, abortController);
+      try {
+        const report = await runner.resumeTask(session.thread, {
+          targetMilestoneId: (params as any).targetMilestoneId,
+          userHint: (params as any).userHint,
+          abortSignal: abortController.signal,
+        });
+        return {
+          sessionId: params.sessionId,
+          modes: {
+            currentModeId: session.currentModeId,
+            availableModes: DEFAULT_MODES,
+          },
+          configOptions: session.configOptions,
+          status: report.status,
+          resumedFromMilestoneId: (params as any).targetMilestoneId,
+          metrics: report,
+        } as any;
+      } finally {
+        sessionAbortControllers.delete(params.sessionId);
+      }
+    }
+
+    return {
+      sessionId: params.sessionId,
+      modes: {
+        currentModeId: session.currentModeId,
+        availableModes: DEFAULT_MODES,
+      },
+      configOptions: session.configOptions,
+      status: 'READY',
+    } as any;
+  });
+
+  // ACP: session/resume
+  dispatcher.registerMethod<ResumeSessionRequest, ResumeSessionResponse>('session/resume', async (params) => {
+    let session = sessions.get(params.sessionId);
+    if (!session) {
+      const fromDb = db.getAcpSession(params.sessionId);
+      if (!fromDb) {
+        const err: any = new Error(`Session '${params.sessionId}' not found`);
+        err.code = ACP_ERROR_CODES.RESOURCE_NOT_FOUND;
+        throw err;
+      }
+      const thread = new ThreadContext(
+        {
+          threadId: fromDb.sessionId,
+          sessionId: fromDb.sessionId,
+          prompt: 'Session resumed',
+          workspacePath: path.resolve(fromDb.cwd),
+        },
+        db,
+        dispatcher
+      );
+      session = {
+        sessionId: fromDb.sessionId,
+        cwd: fromDb.cwd,
+        additionalDirectories: fromDb.additionalDirectories,
+        title: fromDb.title,
+        createdAt: new Date(fromDb.createdAt).toISOString(),
+        updatedAt: new Date(fromDb.updatedAt).toISOString(),
+        currentModeId: fromDb.currentModeId || 'code',
+        configOptions: fromDb.configOptions || createDefaultConfigOptions(true),
+        mcpServers: [],
+        history: [],
+        thread,
+        deleted: false,
+        closed: false,
+      };
+      sessions.set(params.sessionId, session);
+      activeThreads.set(params.sessionId, thread);
+    }
+
+    if (session.deleted) {
+      const err: any = new Error(`Session '${params.sessionId}' not found`);
+      err.code = ACP_ERROR_CODES.RESOURCE_NOT_FOUND;
+      throw err;
+    }
+
+    if (params.cwd) session.cwd = path.resolve(params.cwd);
+    if (params.additionalDirectories) session.additionalDirectories = params.additionalDirectories;
+    if (params.mcpServers) {
+      session.mcpServers = params.mcpServers;
+      for (const server of params.mcpServers) {
+        if ('command' in server) {
+          await mcpManager.mountServer({
+            id: server.name,
+            name: server.name,
+            transport: 'stdio',
+            command: server.command,
+            args: server.args,
+            env: toEnvRecord(server.env),
+          }).catch(() => {});
+        }
+      }
+    }
+
+    return {
+      sessionId: params.sessionId,
+      modes: {
+        currentModeId: session.currentModeId,
+        availableModes: DEFAULT_MODES,
+      },
+      configOptions: session.configOptions,
+    };
+  });
+
+  // ACP: session/list
+  dispatcher.registerMethod<ListSessionsRequest, ListSessionsResponse>('session/list', async (params) => {
+    const cwdFilter = params?.cwd ? path.resolve(params.cwd) : undefined;
+    const result = db.listAcpSessions(cwdFilter, 50, params?.cursor || undefined);
+    return {
+      sessions: result.sessions,
+      nextCursor: result.nextCursor,
+    };
+  });
+
+  // ACP: session/close
+  dispatcher.registerMethod<CloseSessionRequest, CloseSessionResponse>('session/close', async (params) => {
+    const controller = sessionAbortControllers.get(params.sessionId);
+    if (controller) {
+      controller.abort();
+      sessionAbortControllers.delete(params.sessionId);
+    }
+    const session = sessions.get(params.sessionId);
+    if (session) {
+      session.closed = true;
+      session.updatedAt = new Date().toISOString();
+    }
+    return { success: true, sessionId: params.sessionId, closed: true } as any;
+  });
+
+  // ACP: session/delete
+  dispatcher.registerMethod<DeleteSessionRequest, DeleteSessionResponse>('session/delete', async (params) => {
+    const controller = sessionAbortControllers.get(params.sessionId);
+    if (controller) {
+      controller.abort();
+      sessionAbortControllers.delete(params.sessionId);
+    }
+    const session = sessions.get(params.sessionId);
+    if (session) {
+      session.deleted = true;
+      sessions.delete(params.sessionId);
+      activeThreads.delete(params.sessionId);
+    }
+    db.deleteAcpSession(params.sessionId);
+    return { success: true, sessionId: params.sessionId, deleted: true } as any;
+  });
+
+  // ACP: session/prompt
+  dispatcher.registerMethod<PromptRequest, PromptResponse>('session/prompt', async (params) => {
+    const rawPrompt = (params as any)?.prompt ?? (params as any)?.content;
+    const promptText = extractPromptText(rawPrompt);
+
+    let session = sessions.get(params.sessionId);
+    if (!session) {
+      const fromDb = db.getAcpSession(params.sessionId);
+      if (fromDb) {
+        const thread = new ThreadContext(
+          {
+            threadId: fromDb.sessionId,
+            sessionId: fromDb.sessionId,
+            prompt: promptText,
+            workspacePath: path.resolve(fromDb.cwd),
+          },
+          db,
+          dispatcher
+        );
+        session = {
+          sessionId: fromDb.sessionId,
+          cwd: fromDb.cwd,
+          additionalDirectories: fromDb.additionalDirectories,
+          title: fromDb.title,
+          createdAt: new Date(fromDb.createdAt).toISOString(),
+          updatedAt: new Date(fromDb.updatedAt).toISOString(),
+          currentModeId: fromDb.currentModeId || 'code',
+          configOptions: fromDb.configOptions || createDefaultConfigOptions(true),
+          mcpServers: [],
+          history: [],
+          thread,
+          deleted: false,
+          closed: false,
+        };
+        sessions.set(params.sessionId, session);
+        activeThreads.set(params.sessionId, thread);
+      } else {
+        const thread = new ThreadContext(
+          {
+            threadId: params.sessionId,
+            sessionId: params.sessionId,
+            prompt: promptText,
+            workspacePath: root,
+          },
+          db,
+          dispatcher
+        );
+        session = {
+          sessionId: params.sessionId,
+          cwd: root,
+          additionalDirectories: [],
+          title: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          currentModeId: 'code',
+          configOptions: createDefaultConfigOptions(true),
+          mcpServers: [],
+          history: [],
+          thread,
+          deleted: false,
+          closed: false,
+        };
+        sessions.set(params.sessionId, session);
+        activeThreads.set(params.sessionId, thread);
+        db.saveAcpSession({
+          sessionId: params.sessionId,
+          cwd: root,
+          title: null,
+          additionalDirectories: [],
+          currentModeId: 'code',
+          configOptions: session.configOptions,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+    } else {
+      session.thread.setPrompt(promptText);
+      session.updatedAt = new Date().toISOString();
+    }
+
+    // Record and emit user message chunk update
+    const userChunk: SessionUpdate = {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: promptText },
+    };
+    session.history.push(userChunk);
+    dispatcher.emitSessionUpdate({
+      sessionId: params.sessionId,
+      update: userChunk,
+    });
 
     const abortController = new AbortController();
     sessionAbortControllers.set(params.sessionId, abortController);
 
     try {
-      const report = await runner.runTask(thread, {
-        userHint: params.userHint,
+      const report = await runner.runTask(session.thread, {
+        userHint: (params as any)?.userHint,
         abortSignal: abortController.signal,
       });
+
+      if (abortController.signal.aborted) {
+        return {
+          sessionId: params.sessionId,
+          stopReason: 'cancelled',
+          status: 'cancelled',
+          summary: 'Turn cancelled by client',
+          content: [{ type: 'text', text: 'Turn cancelled' }],
+        } as any;
+      }
 
       const summaryText =
         report.status === 'COMPLETED'
@@ -311,12 +860,38 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
           ? 'Execution blocked: requires user input'
           : `Execution failed: ${report.status}`;
 
-      const stopReason =
+      const stopReason: StopReason =
         report.status === 'COMPLETED'
           ? 'end_turn'
           : report.status === 'SUSPENDED_INPUT'
           ? 'requires_action'
           : 'error';
+
+      // Agent message chunk
+      const agentChunk: SessionUpdate = {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: summaryText },
+      };
+      session.history.push(agentChunk);
+      dispatcher.emitSessionUpdate({
+        sessionId: params.sessionId,
+        update: agentChunk,
+      });
+
+      // Usage update
+      const usageUpdate: SessionUpdate = {
+        sessionUpdate: 'usage_update',
+        usage: {
+          inputTokens: (report as any).tokenUsage?.inputTokens || 0,
+          outputTokens: (report as any).tokenUsage?.outputTokens || 0,
+          totalTokens: (report as any).tokenUsage?.totalTokens || 0,
+        },
+      };
+      session.history.push(usageUpdate);
+      dispatcher.emitSessionUpdate({
+        sessionId: params.sessionId,
+        update: usageUpdate,
+      });
 
       return {
         sessionId: params.sessionId,
@@ -326,49 +901,123 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         content: [{ type: 'text', text: summaryText }],
         metrics: report,
       };
+    } catch (err: any) {
+      if (abortController.signal.aborted || err?.name === 'AbortError') {
+        return {
+          sessionId: params.sessionId,
+          stopReason: 'cancelled',
+          status: 'cancelled',
+          summary: 'Turn cancelled',
+          content: [{ type: 'text', text: 'Turn cancelled' }],
+        } as any;
+      }
+      throw err;
     } finally {
       sessionAbortControllers.delete(params.sessionId);
     }
   });
 
-  // ACP: session/load
-  dispatcher.registerMethod<SessionLoadParams, SessionLoadResult>('session/load', async (params) => {
-    const thread = activeThreads.get(params.sessionId);
-    if (!thread) {
-      throw new Error(`Session '${params.sessionId}' not found`);
+  // ACP: session/set_mode
+  dispatcher.registerMethod<SetSessionModeRequest, SetSessionModeResponse>('session/set_mode', async (params) => {
+    const session = sessions.get(params.sessionId);
+    if (!session) {
+      const err: any = new Error(`Session '${params.sessionId}' not found`);
+      err.code = ACP_ERROR_CODES.RESOURCE_NOT_FOUND;
+      throw err;
     }
+    const mode = DEFAULT_MODES.find((m) => m.id === params.modeId);
+    if (!mode) {
+      throw { code: ACP_ERROR_CODES.INVALID_PARAMS, message: `Unknown modeId: ${params.modeId}` };
+    }
+    session.currentModeId = params.modeId;
+    session.updatedAt = new Date().toISOString();
+    db.saveAcpSession({
+      sessionId: session.sessionId,
+      cwd: session.cwd,
+      title: session.title,
+      additionalDirectories: session.additionalDirectories,
+      currentModeId: session.currentModeId,
+      configOptions: session.configOptions,
+      updatedAt: Date.now(),
+    });
 
-    const abortController = new AbortController();
-    sessionAbortControllers.set(params.sessionId, abortController);
+    const modeUpdate: SessionUpdate = {
+      sessionUpdate: 'current_mode_update',
+      modeId: params.modeId,
+    };
+    session.history.push(modeUpdate);
+    dispatcher.emitSessionUpdate({
+      sessionId: params.sessionId,
+      update: modeUpdate,
+    });
 
-    try {
-      const report = await runner.resumeTask(thread, {
-        targetMilestoneId: params.targetMilestoneId,
-        userHint: params.userHint,
-        abortSignal: abortController.signal,
+    return {
+      modes: {
+        currentModeId: session.currentModeId,
+        availableModes: DEFAULT_MODES,
+      },
+    };
+  });
+
+  // ACP: session/set_config_option
+  dispatcher.registerMethod<SetSessionConfigOptionRequest, SetSessionConfigOptionResponse>(
+    'session/set_config_option',
+    async (params) => {
+      const session = sessions.get(params.sessionId);
+      if (!session) {
+        const err: any = new Error(`Session '${params.sessionId}' not found`);
+        err.code = ACP_ERROR_CODES.RESOURCE_NOT_FOUND;
+        throw err;
+      }
+      const option = session.configOptions.find((o) => o.id === params.configOptionId);
+      if (!option) {
+        throw { code: ACP_ERROR_CODES.INVALID_PARAMS, message: `Config option '${params.configOptionId}' not found` };
+      }
+      option.currentValue = params.value;
+      session.updatedAt = new Date().toISOString();
+      db.saveAcpSession({
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        title: session.title,
+        additionalDirectories: session.additionalDirectories,
+        currentModeId: session.currentModeId,
+        configOptions: session.configOptions,
+        updatedAt: Date.now(),
+      });
+
+      const configUpdate: SessionUpdate = {
+        sessionUpdate: 'config_option_update',
+        configOptionId: params.configOptionId,
+        value: params.value,
+      };
+      session.history.push(configUpdate);
+      dispatcher.emitSessionUpdate({
+        sessionId: params.sessionId,
+        update: configUpdate,
       });
 
       return {
-        sessionId: params.sessionId,
-        status: report.status,
-        resumedFromMilestoneId: params.targetMilestoneId,
-        metrics: report,
+        configOptions: session.configOptions,
       };
-    } finally {
-      sessionAbortControllers.delete(params.sessionId);
     }
-  });
+  );
 
-  // ACP: session/cancel
-  dispatcher.registerMethod<SessionCancelParams, SessionCancelResult>('session/cancel', async (params) => {
-    const controller = sessionAbortControllers.get(params.sessionId);
+  // ACP: session/cancel (Both notification and RPC method for compatibility)
+  const handleCancelSession = async (params: SessionCancelParams | any) => {
+    const sessionId = params?.sessionId;
+    if (!sessionId) return { sessionId: '', cancelled: false };
+    const controller = sessionAbortControllers.get(sessionId);
     if (controller) {
       controller.abort();
-      sessionAbortControllers.delete(params.sessionId);
-      return { sessionId: params.sessionId, cancelled: true };
+      sessionAbortControllers.delete(sessionId);
+      return { sessionId, cancelled: true };
     }
-    return { sessionId: params.sessionId, cancelled: false };
+    return { sessionId, cancelled: false };
+  };
+  dispatcher.registerNotification('session/cancel', async (params) => {
+    await handleCancelSession(params);
   });
+  dispatcher.registerMethod<SessionCancelParams, SessionCancelResult>('session/cancel', handleCancelSession);
 
   // =========================================================================
   // 2. Legacy / Task-Centric Compatibility Aliases
@@ -464,6 +1113,27 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
     return { reloadedCount: loaded.length, skills: skillRegistry.listSkills().map((s) => s.id) };
   });
 
+  const clientBridge = {
+    requestPermission: (params: RequestPermissionRequest) =>
+      dispatcher.requestClient<RequestPermissionRequest, RequestPermissionResponse>('session/request_permission', params),
+    readTextFile: (params: ReadTextFileRequest) =>
+      dispatcher.requestClient<ReadTextFileRequest, ReadTextFileResponse>('fs/read_text_file', params),
+    writeTextFile: (params: WriteTextFileRequest) =>
+      dispatcher.requestClient<WriteTextFileRequest, WriteTextFileResponse>('fs/write_text_file', params),
+    createTerminal: (params: CreateTerminalRequest) =>
+      dispatcher.requestClient<CreateTerminalRequest, CreateTerminalResponse>('terminal/create', params),
+    terminalOutput: (params: TerminalOutputRequest) =>
+      dispatcher.requestClient<TerminalOutputRequest, TerminalOutputResponse>('terminal/output', params),
+    waitForTerminalExit: (params: WaitForTerminalExitRequest) =>
+      dispatcher.requestClient<WaitForTerminalExitRequest, WaitForTerminalExitResponse>('terminal/wait_for_exit', params),
+    killTerminal: (params: KillTerminalRequest) =>
+      dispatcher.requestClient<KillTerminalRequest, KillTerminalResponse>('terminal/kill', params),
+    releaseTerminal: (params: ReleaseTerminalRequest) =>
+      dispatcher.requestClient<ReleaseTerminalRequest, ReleaseTerminalResponse>('terminal/release', params),
+    createElicitation: (params: CreateElicitationRequest) =>
+      dispatcher.requestClient<CreateElicitationRequest, CreateElicitationResponse>('elicitation/create', params),
+  };
+
   return {
     db,
     dispatcher,
@@ -476,7 +1146,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
     contextAssembler,
     mcpManager,
     runner,
+    sessions,
     activeThreads,
+    clientBridge,
   };
 }
 
@@ -494,15 +1166,22 @@ function isDirectExecution(): boolean {
 // Direct CLI Execution
 if (isDirectExecution()) {
   const args = process.argv.slice(2);
-  let mode: 'stdio' | 'http' | 'dual' = 'stdio';
-  let port = 3000;
 
-  for (const arg of args) {
-    if (arg.startsWith('--mode=')) mode = arg.split('=')[1] as any;
-    if (arg === '--http') mode = 'http';
-    if (arg === '--dual') mode = 'dual';
-    if (arg.startsWith('--port=')) port = parseInt(arg.split('=')[1], 10);
-  }
+  if (args[0] === 'tui' || args.includes('--tui')) {
+    import('./tui/index.js').then((m) => m.runTui()).catch((err) => {
+      console.error('[MyAgent TUI] Failed to start:', err);
+      process.exit(1);
+    });
+  } else {
+    let mode: 'stdio' | 'http' | 'dual' = 'stdio';
+    let port = 3000;
+
+    for (const arg of args) {
+      if (arg.startsWith('--mode=')) mode = arg.split('=')[1] as any;
+      if (arg === '--http') mode = 'http';
+      if (arg === '--dual') mode = 'dual';
+      if (arg.startsWith('--port=')) port = parseInt(arg.split('=')[1], 10);
+    }
 
   // Write status to stderr so stdout remains 100% clean JSON-RPC for ACP stdio clients
   console.error(`[MyAgent] Starting Agent Runtime (mode: ${mode}, port: ${port})...`);
@@ -514,9 +1193,10 @@ if (isDirectExecution()) {
     autoDiscoverProvider: true,
   });
 
-  if (runtime.httpTransport) {
-    runtime.httpTransport.start().then((actualPort) => {
-      console.error(`[MyAgent] HTTP JSON-RPC & SSE server listening at http://127.0.0.1:${actualPort}`);
-    });
+    if (runtime.httpTransport) {
+      runtime.httpTransport.start().then((actualPort) => {
+        console.error(`[MyAgent] HTTP JSON-RPC & SSE server listening at http://127.0.0.1:${actualPort}`);
+      });
+    }
   }
 }

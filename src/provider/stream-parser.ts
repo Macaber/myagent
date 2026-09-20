@@ -53,6 +53,15 @@ export class StreamParser {
               const delta = choice.delta;
               if (!delta) continue;
 
+              // Thought / reasoning delta (DeepSeek, etc.)
+              const reasoning = (delta as any).reasoning_content ?? (delta as any).reasoning;
+              if (reasoning) {
+                yield {
+                  type: 'thought',
+                  thoughtText: reasoning,
+                };
+              }
+
               // Content text delta
               if (delta.content) {
                 yield {

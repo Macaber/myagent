@@ -93,4 +93,35 @@ describe('StreamParser', () => {
     assert.strictEqual(result.toolCalls[0].function.name, 'edit');
     assert.strictEqual(result.toolCalls[0].function.arguments, '{"filePath":"a.ts"}');
   });
+
+  test('Parses reasoning_content as thought delta chunks', async () => {
+    const sseText = [
+      `data: ${JSON.stringify({ id: '1', choices: [{ delta: { reasoning_content: 'Thinking about' } }] })}\n\n`,
+      `data: ${JSON.stringify({ id: '1', choices: [{ delta: { reasoning_content: ' user greeting' } }] })}\n\n`,
+      `data: ${JSON.stringify({ id: '1', choices: [{ delta: { content: 'Hello!' } }] })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join('');
+
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(sseText));
+        controller.close();
+      },
+    });
+
+    const chunks = [];
+    for await (const chunk of StreamParser.parseSseStream(stream)) {
+      chunks.push(chunk);
+    }
+
+    const thoughtChunks = chunks.filter((c) => c.type === 'thought');
+    assert.strictEqual(thoughtChunks.length, 2);
+    assert.strictEqual(thoughtChunks[0].thoughtText, 'Thinking about');
+    assert.strictEqual(thoughtChunks[1].thoughtText, ' user greeting');
+
+    const contentChunks = chunks.filter((c) => c.type === 'content');
+    assert.strictEqual(contentChunks.length, 1);
+    assert.strictEqual(contentChunks[0].deltaText, 'Hello!');
+  });
 });

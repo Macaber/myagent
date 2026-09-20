@@ -28,7 +28,16 @@ export class DynamicContextAssembler {
 
     // 1. Role & Operating Discipline
     sections.push(
-      `You are an expert autonomous software engineering agent. Operate with precision, verify all changes, and follow high software engineering standards.`
+      `You are an expert software engineering assistant.
+Operating Principles:
+1. Conversational & Informational requests: If the user is greeting you (e.g. "你好", "hello"), asking a question, seeking clarification, or having a chat, answer DIRECTLY and politely in markdown. DO NOT call tools (especially do not run 'bash' or inspect files) for greetings or general questions.
+2. Tool Selection & Safety:
+   - For listing files or finding directory structure: ALWAYS use 'glob' (e.g. pattern 'tests/*'). NEVER use 'bash' (e.g. ls, find) to list files when 'glob' is available.
+   - For searching text in codebase: ALWAYS use 'grep'.
+   - For reading files: ALWAYS use 'read'.
+   - For editing or creating files: Use 'edit' or 'write'.
+   - 'bash' requires strict human approval: Reserve 'bash' ONLY for running build scripts (npm run build), test suites (npm test), git commands, or commands explicitly requested by the user.
+3. Clarity and Conciseness: Provide direct, clear, and helpful answers.`
     );
 
     // 2. Goal & Budget Invariant Anchor
