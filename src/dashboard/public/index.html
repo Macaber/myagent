@@ -142,8 +142,8 @@
       <div>
         <div class="text-zinc-400 font-medium">总会话 (Sessions)</div>
         <div class="text-sm font-bold text-white flex items-center space-x-1.5">
-          <span id="kpi-threads">0</span>
-          <span id="kpi-threads-sub" class="text-[10px] text-zinc-500 font-normal">(0 主 / 0 子)</span>
+          <span id="kpi-sessions">0</span>
+          <span id="kpi-sessions-sub" class="text-[10px] text-zinc-500 font-normal">(0 主 / 0 子)</span>
         </div>
       </div>
     </div>
@@ -214,7 +214,7 @@
           <svg class="w-4 h-4 text-zinc-500 absolute left-2.5 top-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
           </svg>
-          <input type="text" id="search-thread" placeholder="搜索 Prompt 或 Session ID..." class="w-full bg-zinc-900 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-indigo-500">
+          <input type="text" id="search-session" placeholder="搜索 Prompt 或 Session ID..." class="w-full bg-zinc-900 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-indigo-500">
         </div>
         <!-- Status Filter Pills -->
         <div class="flex items-center space-x-1 text-[11px]" id="status-filters">
@@ -226,7 +226,7 @@
       </div>
 
       <!-- Session Tree List -->
-      <div id="thread-tree-list" class="flex-1 overflow-y-auto p-2 space-y-1.5">
+      <div id="session-tree-list" data-thread-tree-list="true" class="flex-1 overflow-y-auto p-2 space-y-1.5">
         <div class="text-center py-12 text-zinc-500 text-xs">正在加载会话列表...</div>
       </div>
     </aside>
@@ -253,7 +253,7 @@
               <div class="flex items-center space-x-2 flex-wrap gap-y-1">
                 <span id="detail-role-badge" class="px-2 py-0.5 rounded text-[11px] font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">Main Agent</span>
                 <span id="detail-status-badge" class="px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">COMPLETED</span>
-                <span class="text-xs font-mono text-zinc-400" id="detail-thread-id">session_xxx</span>
+                <span class="text-xs font-mono text-zinc-400" id="detail-session-id">session_xxx</span>
                 <span id="detail-parent-link" class="hidden text-xs text-amber-400 hover:underline cursor-pointer"></span>
               </div>
               <p class="text-sm font-medium text-zinc-100 leading-relaxed break-words" id="detail-prompt">任务 Prompt 详情...</p>
@@ -281,7 +281,7 @@
                 </svg>
                 <span>删除会话</span>
               </button>
-              <button id="btn-copy-thread-id" class="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-xs text-zinc-300 hover:text-white transition flex items-center space-x-1">
+              <button id="btn-copy-session-id" class="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-xs text-zinc-300 hover:text-white transition flex items-center space-x-1">
                 <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                 </svg>
@@ -427,7 +427,7 @@
         <!-- Tab 3: Raw JSON Inspector -->
         <div id="tab-content-json" class="hidden p-6 space-y-3">
           <div class="flex items-center justify-between">
-            <span class="text-xs text-zinc-400 font-mono">完整的 ThreadDetailReport JSON 数据</span>
+            <span class="text-xs text-zinc-400 font-mono">完整的 SessionDetailReport JSON 数据</span>
             <button id="btn-copy-json" class="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-xs border border-zinc-700">
               复制 JSON
             </button>
@@ -505,12 +505,19 @@
   <!-- JavaScript Application Logic -->
   <script>
     let currentDb = '';
-    let currentThreadId = null;
+    let currentSessionId = null;
     let autoRefreshTimer = null;
-    let cachedThreadDetail = null;
+    let cachedSessionDetail = null;
     let toolChartInstance = null;
     let currentFilterStatus = 'ALL';
     let searchQuery = '';
+
+    // Backwards compatibility aliases for any inline callers
+    window.selectThread = (id) => selectSession(id);
+    window.loadThreadTree = () => loadSessionTree();
+    window.renderThreadTree = (roots) => renderSessionTree(roots);
+    window.loadThreadDetail = (id, show) => loadSessionDetail(id, show);
+    window.renderThreadDetail = (data) => renderSessionDetail(data);
 
     // ================= 1. Initial Loading & DB Selection =================
     async function initDashboard() {
@@ -556,8 +563,8 @@
       if (!currentDb) return;
       await Promise.all([
         loadSummary(),
-        loadThreadTree(),
-        currentThreadId ? loadThreadDetail(currentThreadId, false) : Promise.resolve(),
+        loadSessionTree(),
+        currentSessionId ? loadSessionDetail(currentSessionId, false) : Promise.resolve(),
       ]);
     }
 
@@ -568,8 +575,11 @@
         if (!res.ok) return;
         const s = await res.json();
 
-        document.getElementById('kpi-threads').textContent = s.totalThreads;
-        document.getElementById('kpi-threads-sub').textContent = `(${s.mainThreads} 主 / ${s.subagentThreads} 子)`;
+        const kpiSessionsEl = document.getElementById('kpi-sessions') || document.getElementById('kpi-threads');
+        if (kpiSessionsEl) kpiSessionsEl.textContent = s.totalSessions ?? s.totalThreads;
+        const kpiSessionsSubEl = document.getElementById('kpi-sessions-sub') || document.getElementById('kpi-threads-sub');
+        if (kpiSessionsSubEl) kpiSessionsSubEl.textContent = `(${s.mainSessions ?? s.mainThreads} 主 / ${s.subagentSessions ?? s.subagentThreads} 子)`;
+
         document.getElementById('kpi-tokens').textContent = formatNumber(s.totalTokens.total);
         document.getElementById('kpi-duration').textContent = formatDuration(s.totalDurationMs);
         document.getElementById('kpi-turns').textContent = s.totalTurns;
@@ -582,23 +592,24 @@
     }
 
     // ================= 3. Session Hierarchy Tree =================
-    async function loadThreadTree() {
+    async function loadSessionTree() {
       try {
         const res = await fetch(`/api/dashboard/sessions?db=${encodeURIComponent(currentDb)}`);
         if (!res.ok) return;
         const roots = await res.json();
-        renderThreadTree(roots);
+        renderSessionTree(roots);
       } catch (err) {
         console.error('Error loading session list:', err);
       }
     }
 
-    function renderThreadTree(roots) {
-      const container = document.getElementById('thread-tree-list');
+    function renderSessionTree(roots) {
+      const container = document.getElementById('session-tree-list') || document.getElementById('thread-tree-list');
+      if (!container) return;
       container.innerHTML = '';
 
       // Filter
-      const filtered = filterThreads(roots);
+      const filtered = filterSessions(roots);
 
       if (filtered.length === 0) {
         container.innerHTML = '<div class="text-center py-12 text-zinc-500 text-xs">未找到符合条件的会话</div>';
@@ -606,17 +617,18 @@
       }
 
       filtered.forEach(root => {
-        container.appendChild(createThreadElement(root, false));
+        container.appendChild(createSessionElement(root, false));
       });
     }
 
-    function filterThreads(roots) {
+    function filterSessions(roots) {
       const q = searchQuery.toLowerCase().trim();
       const status = currentFilterStatus;
 
       function match(item) {
         const matchesStatus = (status === 'ALL' || item.currentState === status);
-        const matchesQuery = (!q || item.threadId.toLowerCase().includes(q) || (item.prompt && item.prompt.toLowerCase().includes(q)));
+        const sid = item.sessionId || item.threadId || '';
+        const matchesQuery = (!q || sid.toLowerCase().includes(q) || (item.prompt && item.prompt.toLowerCase().includes(q)));
         return matchesStatus && matchesQuery;
       }
 
@@ -627,10 +639,11 @@
       });
     }
 
-    function createThreadElement(item, isChild = false) {
+    function createSessionElement(item, isChild = false) {
       const el = document.createElement('div');
-      el.className = `thread-card p-3 rounded-lg border cursor-pointer transition ${
-        currentThreadId === item.threadId
+      const itemSessionId = item.sessionId || item.threadId;
+      el.className = `session-card thread-card p-3 rounded-lg border cursor-pointer transition ${
+        currentSessionId === itemSessionId
           ? 'bg-indigo-950/50 border-indigo-500/70 shadow-indigo-900/20 shadow-md'
           : 'bg-zinc-900/60 hover:bg-zinc-850 border-zinc-800/80 hover:border-zinc-700'
       } ${isChild ? 'ml-5 relative mt-1.5' : 'mt-2'}`;
@@ -654,7 +667,7 @@
       else if (item.role === 'coder') roleTag = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">coder</span>`;
       else if (item.role === 'qa') roleTag = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30">qa</span>`;
 
-      const displayId = item.sessionId || item.threadId;
+      const displayId = itemSessionId;
       el.innerHTML += `
         <div class="flex items-center justify-between text-[11px] mb-1">
           <div class="flex items-center space-x-1.5 min-w-0">
@@ -676,20 +689,20 @@
 
       el.onclick = (e) => {
         e.stopPropagation();
-        selectThread(item.threadId);
+        selectSession(itemSessionId);
       };
 
       // Wrap if it has children
       if (item.children && item.children.length > 0) {
         const group = document.createElement('div');
-        group.className = 'thread-group';
+        group.className = 'session-group thread-group';
         group.appendChild(el);
 
         const childrenContainer = document.createElement('div');
         childrenContainer.className = 'tree-line ml-3.5 pl-1.5 border-l-2 border-zinc-800';
 
         item.children.forEach(child => {
-          childrenContainer.appendChild(createThreadElement(child, true));
+          childrenContainer.appendChild(createSessionElement(child, true));
         });
 
         group.appendChild(childrenContainer);
@@ -700,53 +713,54 @@
     }
 
     // ================= 4. Session Detail & Waterfall =================
-    async function selectThread(threadId) {
-      currentThreadId = threadId;
+    async function selectSession(sessionId) {
+      currentSessionId = sessionId;
       // Re-highlight tree item
-      document.querySelectorAll('.thread-card').forEach(c => {
+      document.querySelectorAll('.session-card, .thread-card').forEach(c => {
         c.classList.remove('bg-indigo-950/50', 'border-indigo-500/70');
       });
 
-      await loadThreadDetail(threadId, true);
+      await loadSessionDetail(sessionId, true);
     }
 
-    async function loadThreadDetail(threadId, showLoading = false) {
+    async function loadSessionDetail(sessionId, showLoading = false) {
       try {
-        const res = await fetch(`/api/dashboard/session/${encodeURIComponent(threadId)}?db=${encodeURIComponent(currentDb)}`);
+        const res = await fetch(`/api/dashboard/session/${encodeURIComponent(sessionId)}?db=${encodeURIComponent(currentDb)}`);
         if (!res.ok) return;
         const data = await res.json();
-        cachedThreadDetail = data;
+        cachedSessionDetail = data;
 
-        renderThreadDetail(data);
+        renderSessionDetail(data);
       } catch (err) {
         console.error('Error loading session detail:', err);
       }
     }
 
-    function renderThreadDetail(data) {
+    function renderSessionDetail(data) {
       const emptyState = document.getElementById('empty-state');
       const detailView = document.getElementById('detail-view');
       emptyState.classList.add('hidden');
       detailView.classList.remove('hidden');
 
-      const t = data.thread;
-      const displayId = t.sessionId || t.threadId;
-      document.getElementById('detail-thread-id').textContent = displayId;
-      document.getElementById('detail-prompt').textContent = t.prompt;
-      document.getElementById('detail-workspace').textContent = t.workspacePath;
-      document.getElementById('detail-created-at').textContent = new Date(t.createdAt).toLocaleString();
+      const s = data.session || data.thread;
+      const displayId = s.sessionId || s.threadId;
+      const detailSessionIdEl = document.getElementById('detail-session-id') || document.getElementById('detail-thread-id');
+      if (detailSessionIdEl) detailSessionIdEl.textContent = displayId;
+      document.getElementById('detail-prompt').textContent = s.prompt;
+      document.getElementById('detail-workspace').textContent = s.workspacePath;
+      document.getElementById('detail-created-at').textContent = new Date(s.createdAt).toLocaleString();
 
       // Role badge
       const roleBadge = document.getElementById('detail-role-badge');
-      roleBadge.textContent = t.role === 'main' ? 'Main Agent' : `Subagent: ${t.role}`;
+      roleBadge.textContent = s.role === 'main' ? 'Main Agent' : `Subagent: ${s.role}`;
 
       // Status badge
       const statusBadge = document.getElementById('detail-status-badge');
-      statusBadge.textContent = t.currentState;
+      statusBadge.textContent = s.currentState;
 
       // Mark suspended button for zombie running sessions
       const btnMark = document.getElementById('btn-mark-suspended');
-      if (t.currentState === 'RUNNING') {
+      if (s.currentState === 'RUNNING') {
         btnMark.classList.remove('hidden');
         btnMark.onclick = async () => {
           if (confirm(`确认将会话 ${displayId} 标记为 SUSPENDED (已中断) 吗？`)) {
@@ -766,39 +780,40 @@
 
       // Parent Link
       const parentLink = document.getElementById('detail-parent-link');
-      if (data.parentThread) {
+      const parentSession = data.parentSession || data.parentThread;
+      if (parentSession) {
         parentLink.classList.remove('hidden');
-        const parentId = data.parentThread.sessionId || data.parentThread.threadId;
+        const parentId = parentSession.sessionId || parentSession.threadId;
         parentLink.textContent = `↖ 所属主会话: ${parentId.substring(0, 18)}...`;
-        parentLink.onclick = () => selectThread(parentId);
+        parentLink.onclick = () => selectSession(parentId);
       } else {
         parentLink.classList.add('hidden');
       }
 
       // KPIs
-      document.getElementById('detail-total-tokens').textContent = formatNumber(t.tokens.total);
-      document.getElementById('detail-prompt-tokens').textContent = `Prompt: ${formatNumber(t.tokens.prompt)}`;
-      document.getElementById('detail-comp-tokens').textContent = `Comp: ${formatNumber(t.tokens.completion)}`;
+      document.getElementById('detail-total-tokens').textContent = formatNumber(s.tokens.total);
+      document.getElementById('detail-prompt-tokens').textContent = `Prompt: ${formatNumber(s.tokens.prompt)}`;
+      document.getElementById('detail-comp-tokens').textContent = `Comp: ${formatNumber(s.tokens.completion)}`;
 
-      const pPct = t.tokens.total > 0 ? (t.tokens.prompt / t.tokens.total) * 100 : 50;
+      const pPct = s.tokens.total > 0 ? (s.tokens.prompt / s.tokens.total) * 100 : 50;
       const cPct = 100 - pPct;
       document.getElementById('bar-prompt-token').style.width = `${pPct}%`;
       document.getElementById('bar-comp-token').style.width = `${cPct}%`;
 
-      document.getElementById('detail-duration').textContent = formatDuration(t.durationMs);
-      document.getElementById('detail-latency-sub').textContent = `精确耗时: ${t.durationMs.toLocaleString()} ms`;
+      document.getElementById('detail-duration').textContent = formatDuration(s.durationMs);
+      document.getElementById('detail-latency-sub').textContent = `精确耗时: ${s.durationMs.toLocaleString()} ms`;
 
-      document.getElementById('detail-turns-count').textContent = t.totalTurns;
-      document.getElementById('detail-steps-count').textContent = t.totalSteps;
-      const avgStep = t.totalSteps > 0 ? Math.round(t.durationMs / t.totalSteps) : 0;
+      document.getElementById('detail-turns-count').textContent = s.totalTurns;
+      document.getElementById('detail-steps-count').textContent = s.totalSteps;
+      const avgStep = s.totalSteps > 0 ? Math.round(s.durationMs / s.totalSteps) : 0;
       document.getElementById('detail-avg-step-time').textContent = `平均单步耗时: ${avgStep} ms`;
 
       const subCount = data.subagentsSummary ? data.subagentsSummary.length : 0;
       document.getElementById('detail-subagents-count').textContent = subCount;
       if (subCount > 0) {
-        document.getElementById('detail-subagents-list').textContent = data.subagentsSummary.map(s => s.role).join(', ');
+        document.getElementById('detail-subagents-list').textContent = data.subagentsSummary.map(item => item.role).join(', ');
       } else {
-        document.getElementById('detail-subagents-list').textContent = '无子任务';
+        document.getElementById('detail-subagents-list').textContent = '无子智能体调用';
       }
 
       // Render Waterfall Turns & Steps
@@ -832,18 +847,32 @@
           return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono border ${color}">${tool}: ${count}</span>`;
         }).join(' ');
 
+        // Friendly badge name for turn type
+        let turnTypeBadge = '';
+        if (turn.turnType === 'USER_INPUT') {
+          turnTypeBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-blue-900/50 text-blue-300 border border-blue-600/50 shrink-0">💬 对话轮次</span>';
+        } else if (turn.turnType === 'WORKER') {
+          turnTypeBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-900/50 text-purple-300 border border-purple-600/50 shrink-0">🎯 任务里程碑</span>';
+        } else if (turn.turnType === 'PLANNING') {
+          turnTypeBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-cyan-900/50 text-cyan-300 border border-cyan-600/50 shrink-0">📐 任务规划</span>';
+        } else if (turn.turnType === 'APPROVAL') {
+          turnTypeBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-900/50 text-amber-300 border border-amber-600/50 shrink-0">✋ 审批等待</span>';
+        } else {
+          turnTypeBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-zinc-800 text-zinc-300 border border-zinc-700 shrink-0">${escapeHtml(turn.turnType)}</span>`;
+        }
+
         turnCard.innerHTML = `
           <!-- Turn Header -->
           <div class="turn-header p-3.5 bg-zinc-850 hover:bg-zinc-800/80 flex items-center justify-between cursor-pointer transition select-none">
             <div class="flex items-center space-x-3 flex-wrap gap-y-1 min-w-0 flex-1 mr-4">
               <span class="font-bold text-xs text-white shrink-0">Turn #${turn.turnIndex + 1}</span>
-              <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-900/40 text-indigo-300 border border-indigo-700/50 shrink-0">${turn.turnType}</span>
+              ${turnTypeBadge}
               ${turn.userPrompt ? `
-                <span class="text-xs text-amber-300/90 font-medium truncate max-w-[450px]" title="${escapeHtml(turn.userPrompt)}">
-                  👤 提问: "${escapeHtml(turn.userPrompt)}"
+                <span class="text-xs text-amber-300 font-medium truncate max-w-[500px]" title="${escapeHtml(turn.userPrompt)}">
+                  👤 用户提问: "${escapeHtml(turn.userPrompt)}"
                 </span>
               ` : `
-                <span class="text-xs text-zinc-400 font-medium truncate max-w-[450px]">${escapeHtml(turn.summary ? (turn.summary.length > 50 ? turn.summary.slice(0, 50) + '...' : turn.summary) : 'Turn 执行轮次')}</span>
+                <span class="text-xs text-zinc-400 font-medium truncate max-w-[500px]">${escapeHtml(turn.summary ? (turn.summary.length > 50 ? turn.summary.slice(0, 50) + '...' : turn.summary) : 'Turn 执行轮次')}</span>
               `}
             </div>
             <div class="flex items-center space-x-3 text-xs text-zinc-400 font-mono shrink-0">
@@ -864,18 +893,40 @@
           </div>
 
           <!-- Turn Steps Drawer (Default Expanded) -->
-          <div class="turn-steps-body p-3 bg-zinc-950/90 border-t border-zinc-800 space-y-2">
+          <div class="turn-steps-body p-3.5 bg-zinc-950/95 border-t border-zinc-800 space-y-3">
+            <!-- 1. Explicit User Input Card -->
+            <div class="p-3 bg-amber-500/10 rounded-lg border border-amber-500/25 text-xs shadow-sm">
+              <div class="text-[11px] font-bold text-amber-300 flex items-center space-x-1.5 mb-1">
+                <span>👤 用户输入 (User Input):</span>
+              </div>
+              <div class="text-amber-100 text-xs font-mono font-medium whitespace-pre-wrap pl-1">
+                ${escapeHtml(turn.userPrompt || '（此轮次无独立用户提问或继承自上下文）')}
+              </div>
+            </div>
+
+            <!-- 2. Explicit Model Output Card -->
             ${turn.summary ? `
-              <div class="p-3 bg-zinc-900/90 rounded-lg border border-zinc-800/80 text-xs mb-2">
-                <div class="text-[11px] font-semibold text-emerald-400 mb-1.5 flex items-center space-x-1.5">
-                  <span>💬 智能体最终回复 / 产出总结:</span>
+              <div class="p-3 bg-zinc-900/90 rounded-lg border border-emerald-500/30 text-xs shadow-sm">
+                <div class="text-[11px] font-bold text-emerald-400 mb-1.5 flex items-center space-x-1.5">
+                  <span>🤖 模型输出 / 智能体回复 (Model Output):</span>
                 </div>
-                <div class="whitespace-pre-wrap leading-relaxed text-zinc-300 text-[11px] font-sans bg-zinc-950/70 p-2.5 rounded border border-zinc-800/60 max-h-96 overflow-y-auto code-scroll">
+                <div class="whitespace-pre-wrap leading-relaxed text-zinc-200 text-[12px] font-sans bg-zinc-950/80 p-3 rounded-md border border-zinc-800/80 max-h-96 overflow-y-auto code-scroll">
                   ${escapeHtml(turn.summary)}
                 </div>
               </div>
             ` : ''}
-            ${renderStepItems(turn.steps)}
+
+            <!-- 3. Steps & Tool Calls Execution Flow -->
+            ${turn.steps && turn.steps.length > 0 ? `
+              <div class="pt-1">
+                <div class="text-[10px] uppercase tracking-wider text-zinc-400 font-semibold mb-2 px-1 flex items-center justify-between">
+                  <span>🐾 执行步骤明细 (Execution Steps: ${turn.steps.length})</span>
+                </div>
+                <div class="space-y-2">
+                  ${renderStepItems(turn.steps)}
+                </div>
+              </div>
+            ` : ''}
           </div>
         `;
 
@@ -1058,7 +1109,7 @@
             <td class="py-2 text-right text-zinc-400 font-mono">${formatDuration(s.durationMs)}</td>
             <td class="py-2 text-right text-emerald-400 font-mono">${s.status}</td>
             <td class="py-2 text-right">
-              <button class="text-indigo-400 hover:text-indigo-300 underline" onclick="selectThread('${s.threadId}')">查看明细</button>
+              <button class="text-indigo-400 hover:text-indigo-300 underline" onclick="selectSession('${s.sessionId || s.threadId}')">查看明细</button>
             </td>
           `;
           subTbody.appendChild(tr);
@@ -1071,7 +1122,7 @@
       // Database change
       document.getElementById('db-select').onchange = (e) => {
         currentDb = e.target.value;
-        currentThreadId = null;
+        currentSessionId = null;
         document.getElementById('detail-view').classList.add('hidden');
         document.getElementById('empty-state').classList.remove('hidden');
         refreshDashboard();
@@ -1101,10 +1152,13 @@
       };
 
       // Search input
-      document.getElementById('search-thread').oninput = (e) => {
-        searchQuery = e.target.value;
-        loadThreadTree();
-      };
+      const searchInput = document.getElementById('search-session') || document.getElementById('search-thread');
+      if (searchInput) {
+        searchInput.oninput = (e) => {
+          searchQuery = e.target.value;
+          loadSessionTree();
+        };
+      }
 
       // Status filter pills
       document.querySelectorAll('.filter-pill').forEach(btn => {
@@ -1113,10 +1167,10 @@
             b.classList.remove('bg-indigo-600', 'text-white');
             b.classList.add('bg-zinc-800', 'text-zinc-400');
           });
-          btn.classList.remove('bg-zinc-800', 'text-zinc-400');
           btn.classList.add('bg-indigo-600', 'text-white');
+          btn.classList.remove('bg-zinc-800', 'text-zinc-400');
           currentFilterStatus = btn.dataset.status;
-          loadThreadTree();
+          loadSessionTree();
         };
       });
 
@@ -1170,13 +1224,14 @@
       };
       document.body.onclick = () => exportMenu.classList.add('hidden');
 
-      // Export Current Session
+      // Export Current Session JSON
       document.getElementById('btn-export-current').onclick = () => {
-        if (!cachedThreadDetail) {
+        if (!cachedSessionDetail) {
           alert('请先选择一个 Session 才能导出');
           return;
         }
-        downloadJson(cachedThreadDetail, `session-${cachedThreadDetail.thread.sessionId || cachedThreadDetail.thread.threadId}.json`);
+        const sid = cachedSessionDetail.session?.sessionId || cachedSessionDetail.session?.threadId || currentSessionId;
+        downloadJson(cachedSessionDetail, `session-${sid}.json`);
       };
 
       // Export All Database
@@ -1185,17 +1240,20 @@
       };
 
       // Copy Session ID
-      document.getElementById('btn-copy-thread-id').onclick = () => {
-        if (currentThreadId) {
-          navigator.clipboard.writeText(currentThreadId);
-          alert('已复制 Session ID 到剪贴板');
-        }
-      };
+      const btnCopySessionId = document.getElementById('btn-copy-session-id') || document.getElementById('btn-copy-thread-id');
+      if (btnCopySessionId) {
+        btnCopySessionId.onclick = () => {
+          if (currentSessionId) {
+            navigator.clipboard.writeText(currentSessionId);
+            alert('已复制 Session ID 到剪贴板');
+          }
+        };
+      }
 
       // Copy Raw JSON
       document.getElementById('btn-copy-json').onclick = () => {
-        if (cachedThreadDetail) {
-          navigator.clipboard.writeText(JSON.stringify(cachedThreadDetail, null, 2));
+        if (cachedSessionDetail) {
+          navigator.clipboard.writeText(JSON.stringify(cachedSessionDetail, null, 2));
           alert('已复制完整 JSON 到剪贴板');
         }
       };
@@ -1204,8 +1262,8 @@
       const btnDeleteSession = document.getElementById('btn-delete-session');
       if (btnDeleteSession) {
         btnDeleteSession.onclick = async () => {
-          if (!currentThreadId) return;
-          const targetId = cachedThreadDetail?.thread?.sessionId || cachedThreadDetail?.thread?.threadId || currentThreadId;
+          if (!currentSessionId) return;
+          const targetId = cachedSessionDetail?.session?.sessionId || cachedSessionDetail?.sessionId || currentSessionId;
           if (!confirm(`确认彻底删除会话 [${targetId}] 及其所有历史轮次、步骤和产物吗？\n此操作不可逆！`)) {
             return;
           }
@@ -1217,17 +1275,17 @@
             });
             const result = await res.json();
             if (res.ok && result.success) {
-              currentThreadId = null;
-              cachedThreadDetail = null;
+              currentSessionId = null;
+              cachedSessionDetail = null;
               document.getElementById('detail-view').classList.add('hidden');
               document.getElementById('empty-state').classList.remove('hidden');
               await refreshDashboard();
-              alert(`🗑 已彻底删除会话: ${targetId}`);
+              alert(`✅ 会话 [${targetId}] 已彻底删除`);
             } else {
-              alert(`删除失败: ${result.error || '未知错误'}`);
+              alert(`❌ 删除失败: ${result.error || result.message || '未知错误'}`);
             }
           } catch (err) {
-            alert(`删除请求失败: ${err.message}`);
+            alert(`❌ 网络或服务端错误: ${err.message}`);
           }
         };
       }
@@ -1248,8 +1306,8 @@
             });
             const result = await res.json();
             if (res.ok && result.success) {
-              currentThreadId = null;
-              cachedThreadDetail = null;
+              currentSessionId = null;
+              cachedSessionDetail = null;
               document.getElementById('detail-view').classList.add('hidden');
               document.getElementById('empty-state').classList.remove('hidden');
               await refreshDashboard();
@@ -1263,26 +1321,26 @@
         };
       }
 
-      // Resume Session Modal Controls
-      const resumeModal = document.getElementById('resume-modal');
+      // Resume Session Modal Triggers
       const btnResumeSession = document.getElementById('btn-resume-session');
+      const resumeModal = document.getElementById('resume-modal');
       const btnCloseResumeModal = document.getElementById('btn-close-resume-modal');
       const btnCancelResume = document.getElementById('btn-cancel-resume');
       const btnSubmitResume = document.getElementById('btn-submit-resume');
-      const btnCopyCliResume = document.getElementById('btn-copy-cli-resume');
-      const resumeSessionIdEl = document.getElementById('resume-modal-session-id');
+      const resumeSessionIdEl = document.getElementById('resume-session-id');
       const resumeCliCmdEl = document.getElementById('resume-cli-cmd');
+      const btnCopyCliResume = document.getElementById('btn-copy-cli-resume');
       const resumePromptInput = document.getElementById('resume-prompt-input');
       const resumeSpinner = document.getElementById('resume-spinner');
       const resumeSubmitText = document.getElementById('resume-submit-text');
 
       if (btnResumeSession) {
         btnResumeSession.onclick = () => {
-          if (!currentThreadId) {
+          if (!currentSessionId) {
             alert('请先在左侧选择一个会话 (Session)');
             return;
           }
-          const targetSessionId = cachedThreadDetail?.thread?.sessionId || cachedThreadDetail?.thread?.threadId || currentThreadId;
+          const targetSessionId = cachedSessionDetail?.session?.sessionId || cachedSessionDetail?.sessionId || currentSessionId;
           resumeSessionIdEl.textContent = targetSessionId;
           const isCheckpoint = document.querySelector('input[name="resume-mode"]:checked')?.value === 'checkpoint';
           resumeCliCmdEl.textContent = isCheckpoint
@@ -1303,7 +1361,7 @@
       // Mode switch
       document.querySelectorAll('input[name="resume-mode"]').forEach(r => {
         r.onchange = (e) => {
-          const targetSessionId = cachedThreadDetail?.thread?.sessionId || cachedThreadDetail?.thread?.threadId || currentThreadId || 'session_xxx';
+          const targetSessionId = cachedSessionDetail?.session?.sessionId || cachedSessionDetail?.sessionId || currentSessionId || 'session_xxx';
           if (e.target.value === 'checkpoint') {
             resumePromptInput.placeholder = '（可选）针对性断点重试提示词，留空则直接执行重试剩余里程碑...';
             resumeCliCmdEl.textContent = `npm run task -- --resume ${targetSessionId}`;
@@ -1325,8 +1383,8 @@
       // Submit Resume
       if (btnSubmitResume) {
         btnSubmitResume.onclick = async () => {
-          if (!currentThreadId) return;
-          const targetSessionId = cachedThreadDetail?.thread?.sessionId || cachedThreadDetail?.thread?.threadId || currentThreadId;
+          if (!currentSessionId) return;
+          const targetSessionId = cachedSessionDetail?.session?.sessionId || cachedSessionDetail?.sessionId || currentSessionId;
           const mode = document.querySelector('input[name="resume-mode"]:checked')?.value || 'continue';
           const prompt = resumePromptInput.value.trim();
 
@@ -1371,16 +1429,17 @@
         reader.onload = (evt) => {
           try {
             const parsed = JSON.parse(evt.target.result);
-            if (parsed.thread && parsed.turns) {
-              // It's a single thread detail report
-              cachedThreadDetail = parsed;
-              renderThreadDetail(parsed);
-              alert('成功加载离线 Thread JSON 数据！');
-            } else if (parsed.threads && Array.isArray(parsed.threads)) {
+            if ((parsed.session || parsed.thread) && parsed.turns) {
+              // It's a single session detail report
+              cachedSessionDetail = parsed;
+              renderSessionDetail(parsed);
+              alert('成功加载离线 Session JSON 数据！');
+            } else if ((parsed.sessions || parsed.threads) && Array.isArray(parsed.sessions || parsed.threads)) {
               // It's a full export
-              renderThreadTree(parsed.threads);
-              if (parsed.threads.length > 0) {
-                renderThreadDetail(parsed.threads[0]);
+              const list = parsed.sessions || parsed.threads;
+              renderSessionTree(list);
+              if (list.length > 0) {
+                renderSessionDetail(list[0]);
               }
               alert('成功加载离线完整数据库 JSON！');
             } else {

@@ -115,7 +115,7 @@ describe('Agent Telemetry Dashboard & HTTP API', () => {
     assert.strictEqual(htmlRes.headers.get('content-type')?.includes('text/html'), true);
     const htmlText = await htmlRes.text();
     assert.ok(htmlText.includes('MyAgent Telemetry'));
-    assert.ok(htmlText.includes('id="thread-tree-list"'));
+    assert.ok(htmlText.includes('id="session-tree-list"') || htmlText.includes('id="thread-tree-list"'));
 
     // 2. Test GET /api/dashboard/databases
     const dbsRes = await fetch(`http://127.0.0.1:${serverPort}/api/dashboard/databases`);

@@ -14,6 +14,9 @@ export interface DatabaseMeta {
 
 export interface DashboardSummary {
   database: DatabaseMeta;
+  totalSessions: number;
+  mainSessions: number;
+  subagentSessions: number;
   totalThreads: number;
   mainThreads: number;
   subagentThreads: number;
@@ -31,10 +34,9 @@ export interface DashboardSummary {
   totalSkillCalls: number;
 }
 
-export interface ThreadTreeItem {
-  threadId: string;
+export interface SessionTreeItem {
   sessionId: string;
-  parentThreadId: string | null;
+  parentSessionId: string | null;
   role: string;
   currentState: string;
   prompt: string;
@@ -51,13 +53,19 @@ export interface ThreadTreeItem {
   totalTurns: number;
   totalSteps: number;
   errorMessage: string | null;
-  children: ThreadTreeItem[];
+  children: SessionTreeItem[];
+  // Backwards compatibility alias
+  threadId: string;
+  parentThreadId: string | null;
 }
+
+export type ThreadTreeItem = SessionTreeItem;
 
 export interface StepDetail {
   stepId: string;
   turnId: string;
-  threadId: string;
+  sessionId: string;
+  threadId: string; // compatibility alias
   stepIndex: number;
   stepType: string;
   toolName: string | null;
@@ -81,7 +89,8 @@ export interface StepDetail {
 
 export interface TurnDetail {
   turnId: string;
-  threadId: string;
+  sessionId: string;
+  threadId: string; // compatibility alias
   turnIndex: number;
   turnType: string;
   milestoneId: string | null;
@@ -107,11 +116,10 @@ export interface TurnDetail {
   steps: StepDetail[];
 }
 
-export interface ThreadDetailReport {
-  thread: ThreadTreeItem;
-  parentThread?: {
-    threadId: string;
-    sessionId?: string;
+export interface SessionDetailReport {
+  session: SessionTreeItem;
+  parentSession?: {
+    sessionId: string;
     prompt: string;
     role: string;
   };
@@ -124,15 +132,25 @@ export interface ThreadDetailReport {
     failedCount: number;
   }>;
   subagentsSummary: Array<{
+    sessionId: string;
     threadId: string;
-    sessionId?: string;
     role: string;
     prompt: string;
     totalTokens: number;
     durationMs: number;
     status: string;
   }>;
+  // Backwards compatibility aliases
+  thread: SessionTreeItem;
+  parentThread?: {
+    threadId: string;
+    sessionId?: string;
+    prompt: string;
+    role: string;
+  };
 }
+
+export type ThreadDetailReport = SessionDetailReport;
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -260,6 +278,9 @@ export class DashboardService {
 
     const emptySummary: DashboardSummary = {
       database: meta,
+      totalSessions: 0,
+      mainSessions: 0,
+      subagentSessions: 0,
       totalThreads: 0,
       mainThreads: 0,
       subagentThreads: 0,
@@ -318,11 +339,18 @@ export class DashboardService {
         FROM steps
       `).get() as any;
 
+      const totalSessions = Number(threadStats?.totalThreads || 0);
+      const mainSessions = Number(threadStats?.mainThreads || 0);
+      const subagentSessions = Number(threadStats?.subagentThreads || 0);
+
       return {
         database: meta,
-        totalThreads: Number(threadStats?.totalThreads || 0),
-        mainThreads: Number(threadStats?.mainThreads || 0),
-        subagentThreads: Number(threadStats?.subagentThreads || 0),
+        totalSessions,
+        mainSessions,
+        subagentSessions,
+        totalThreads: totalSessions,
+        mainThreads: mainSessions,
+        subagentThreads: subagentSessions,
         statusCounts,
         totalTokens: {
           prompt: Number(threadStats?.totalPromptTokens || 0),
@@ -345,9 +373,9 @@ export class DashboardService {
   }
 
   /**
-   * Returns full thread list with parent-child tree hierarchy.
+   * Returns full session list with parent-child tree hierarchy.
    */
-  public static getThreadList(requestedDb?: string): ThreadTreeItem[] {
+  public static getSessionList(requestedDb?: string): SessionTreeItem[] {
     const dbPath = this.resolveDbPath(requestedDb);
     const db = this.openDb(dbPath);
     if (!db) return [];
@@ -363,8 +391,8 @@ export class DashboardService {
         ORDER BY created_at DESC
       `).all() as any[];
 
-      const itemMap = new Map<string, ThreadTreeItem>();
-      const rootItems: ThreadTreeItem[] = [];
+      const itemMap = new Map<string, SessionTreeItem>();
+      const rootItems: SessionTreeItem[] = [];
 
       for (const r of rows) {
         let role = 'main';
@@ -378,9 +406,10 @@ export class DashboardService {
 
         const duration = Number(r.total_duration_ms) || (r.completed_at ? Number(r.completed_at) - Number(r.created_at) : Date.now() - Number(r.created_at));
 
-        const item: ThreadTreeItem = {
-          threadId: r.thread_id,
+        const item: SessionTreeItem = {
           sessionId: r.session_id || r.thread_id,
+          threadId: r.thread_id,
+          parentSessionId: r.parent_thread_id || null,
           parentThreadId: r.parent_thread_id || null,
           role,
           currentState: r.current_state,
@@ -405,8 +434,9 @@ export class DashboardService {
 
       // Build hierarchy
       for (const item of itemMap.values()) {
-        if (item.parentThreadId && itemMap.has(item.parentThreadId)) {
-          const parent = itemMap.get(item.parentThreadId)!;
+        const parentId = item.parentSessionId || item.parentThreadId;
+        if (parentId && itemMap.has(parentId)) {
+          const parent = itemMap.get(parentId)!;
           if (!parent.children.some(c => c.threadId === item.threadId)) {
             parent.children.push(item);
           }
@@ -424,83 +454,86 @@ export class DashboardService {
 
       return rootItems;
     } catch (err) {
-      console.error(`[DashboardService] Error getting thread list from ${dbPath}:`, err);
+      console.error(`[DashboardService] Error getting session list from ${dbPath}:`, err);
       return [];
     } finally {
       db.close();
     }
   }
 
+  public static getThreadList = (requestedDb?: string) => DashboardService.getSessionList(requestedDb);
+
   /**
-   * Returns deep, detailed analytics for a single thread, including all turns, steps, tool/skill usage.
+   * Returns deep, detailed analytics for a single session, including all turns, steps, tool/skill usage.
    */
-  public static getThreadDetail(requestedDb: string | undefined, threadId: string): ThreadDetailReport | null {
+  public static getSessionDetail(requestedDb: string | undefined, sessionId: string): SessionDetailReport | null {
     const dbPath = this.resolveDbPath(requestedDb);
     const db = this.openDb(dbPath);
     if (!db) return null;
 
     try {
-      const mappedId = threadId.startsWith('task_') ? threadId.replace(/^task_/, 'session_') : (threadId.startsWith('session_') ? threadId.replace(/^session_/, 'task_') : threadId);
-      const threadRow = db.prepare('SELECT * FROM threads WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ? LIMIT 1').get(threadId, threadId, mappedId, mappedId) as any;
-      if (!threadRow) return null;
+      const mappedId = sessionId.startsWith('task_') ? sessionId.replace(/^task_/, 'session_') : (sessionId.startsWith('session_') ? sessionId.replace(/^session_/, 'task_') : sessionId);
+      const sessionRow = db.prepare('SELECT * FROM threads WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ? LIMIT 1').get(sessionId, sessionId, mappedId, mappedId) as any;
+      if (!sessionRow) return null;
 
-      const effectiveId = threadRow.session_id || threadRow.thread_id;
-      const actualThreadId = threadRow.thread_id;
+      const effectiveId = sessionRow.session_id || sessionRow.thread_id;
+      const rawSessionId = sessionRow.thread_id;
 
       let role = 'main';
-      const promptStr = String(threadRow.prompt || '');
+      const promptStr = String(sessionRow.prompt || '');
       const roleMatch = promptStr.match(/^\[Subagent:\s*([^\]]+)\]/i);
       if (roleMatch) {
         role = roleMatch[1].trim();
-      } else if (threadRow.parent_thread_id) {
+      } else if (sessionRow.parent_thread_id) {
         role = 'subagent';
       }
 
-      const duration = Number(threadRow.total_duration_ms) || (threadRow.completed_at ? Number(threadRow.completed_at) - Number(threadRow.created_at) : Date.now() - Number(threadRow.created_at));
+      const duration = Number(sessionRow.total_duration_ms) || (sessionRow.completed_at ? Number(sessionRow.completed_at) - Number(sessionRow.created_at) : Date.now() - Number(sessionRow.created_at));
 
-      const threadItem: ThreadTreeItem = {
-        threadId: actualThreadId,
+      const sessionItem: SessionTreeItem = {
         sessionId: effectiveId,
-        parentThreadId: threadRow.parent_thread_id || null,
+        threadId: rawSessionId,
+        parentSessionId: sessionRow.parent_thread_id || null,
+        parentThreadId: sessionRow.parent_thread_id || null,
         role,
-        currentState: threadRow.current_state,
-        prompt: threadRow.prompt,
-        workspacePath: threadRow.workspace_path,
-        createdAt: Number(threadRow.created_at),
-        updatedAt: Number(threadRow.updated_at),
-        completedAt: threadRow.completed_at ? Number(threadRow.completed_at) : null,
+        currentState: sessionRow.current_state,
+        prompt: sessionRow.prompt,
+        workspacePath: sessionRow.workspace_path,
+        createdAt: Number(sessionRow.created_at),
+        updatedAt: Number(sessionRow.updated_at),
+        completedAt: sessionRow.completed_at ? Number(sessionRow.completed_at) : null,
         durationMs: duration,
         tokens: {
-          prompt: Number(threadRow.total_prompt_tokens),
-          completion: Number(threadRow.total_completion_tokens),
-          total: Number(threadRow.total_tokens),
+          prompt: Number(sessionRow.total_prompt_tokens),
+          completion: Number(sessionRow.total_completion_tokens),
+          total: Number(sessionRow.total_tokens),
         },
-        totalTurns: Number(threadRow.total_turns),
-        totalSteps: Number(threadRow.total_steps),
-        errorMessage: threadRow.error_message || null,
+        totalTurns: Number(sessionRow.total_turns),
+        totalSteps: Number(sessionRow.total_steps),
+        errorMessage: sessionRow.error_message || null,
         children: [],
       };
 
       // Check if parent exists
-      let parentThread: { threadId: string; sessionId?: string; prompt: string; role: string } | undefined;
-      if (threadRow.parent_thread_id) {
-        const parentRow = db.prepare('SELECT thread_id, session_id, prompt FROM threads WHERE thread_id = ? OR session_id = ?').get(threadRow.parent_thread_id, threadRow.parent_thread_id) as any;
+      let parentSession: { sessionId: string; threadId?: string; prompt: string; role: string } | undefined;
+      if (sessionRow.parent_thread_id) {
+        const parentRow = db.prepare('SELECT thread_id, session_id, prompt FROM threads WHERE thread_id = ? OR session_id = ?').get(sessionRow.parent_thread_id, sessionRow.parent_thread_id) as any;
         if (parentRow) {
           const parentEffectiveId = parentRow.session_id || parentRow.thread_id;
-          parentThread = {
-            threadId: parentEffectiveId,
+          parentSession = {
             sessionId: parentEffectiveId,
+            threadId: parentEffectiveId,
             prompt: parentRow.prompt,
             role: 'main',
           };
         }
       }
 
-      // Child subagents for this thread
+      // Child subagents for this session
       const childRows = db.prepare(`
         SELECT thread_id, session_id, prompt, current_state, total_tokens, total_duration_ms
         FROM threads WHERE parent_thread_id = ? OR parent_thread_id = ? ORDER BY created_at ASC
-      `).all(actualThreadId, effectiveId) as any[];
+      `).all(rawSessionId, effectiveId) as any[];
 
       const subagentsSummary = childRows.map((c) => {
         let childRole = 'explore';
@@ -518,15 +551,15 @@ export class DashboardService {
         };
       });
 
-      // Query child threads steps so invoke_subagent steps can nest them
-      const childThreadIds = childRows.map((c) => c.thread_id);
+      // Query child sessions steps so invoke_subagent steps can nest them
+      const childSessionIds = childRows.map((c) => c.thread_id);
       const childStepsMap = new Map<string, StepDetail[]>();
 
-      if (childThreadIds.length > 0) {
-        const placeholders = childThreadIds.map(() => '?').join(',');
+      if (childSessionIds.length > 0) {
+        const placeholders = childSessionIds.map(() => '?').join(',');
         const childStepRows = db.prepare(`
           SELECT * FROM steps WHERE thread_id IN (${placeholders}) ORDER BY step_index ASC
-        `).all(...childThreadIds) as any[];
+        `).all(...childSessionIds) as any[];
 
         for (const cs of childStepRows) {
           let parsedMetadata: any = null;
@@ -540,6 +573,7 @@ export class DashboardService {
           const csDetail: StepDetail = {
             stepId: cs.step_id,
             turnId: cs.turn_id,
+            sessionId: cs.thread_id,
             threadId: cs.thread_id,
             stepIndex: Number(cs.step_index),
             stepType: cs.step_type,
@@ -569,12 +603,12 @@ export class DashboardService {
       // Query turns
       const turnRows = db.prepare(`
         SELECT * FROM turns WHERE thread_id = ? OR thread_id = ? ORDER BY turn_index ASC
-      `).all(actualThreadId, effectiveId) as any[];
+      `).all(rawSessionId, effectiveId) as any[];
 
       // Query steps
       const stepRows = db.prepare(`
         SELECT * FROM steps WHERE thread_id = ? OR thread_id = ? ORDER BY turn_id, step_index ASC
-      `).all(actualThreadId, effectiveId) as any[];
+      `).all(rawSessionId, effectiveId) as any[];
 
       const stepsByTurn = new Map<string, StepDetail[]>();
 
@@ -615,6 +649,7 @@ export class DashboardService {
         const stepDetail: StepDetail = {
           stepId: s.step_id,
           turnId: s.turn_id,
+          sessionId: effectiveId,
           threadId: s.thread_id,
           stepIndex: Number(s.step_index),
           stepType: s.step_type,
@@ -679,7 +714,8 @@ export class DashboardService {
 
         return {
           turnId: t.turn_id,
-          threadId: t.thread_id,
+          sessionId: effectiveId,
+          threadId: effectiveId, // compatibility alias
           turnIndex: Number(t.turn_index),
           turnType: t.turn_type,
           milestoneId: t.milestone_id || null,
@@ -694,7 +730,7 @@ export class DashboardService {
           },
           stepCount: turnSteps.length + extraSubagentSteps,
           summary: t.summary || null,
-          userPrompt: t.user_prompt || undefined,
+          userPrompt: t.user_prompt || (Number(t.turn_index) === 0 ? sessionRow.prompt : undefined),
           metrics: {
             toolCallsCount,
             subagentCallsCount,
@@ -706,7 +742,7 @@ export class DashboardService {
         };
       });
 
-      // Aggregate thread tool summary (including tools called by subagents!)
+      // Aggregate session tool summary (including tools called by subagents!)
       const toolSummaryRows = db.prepare(`
         SELECT tool_name,
                COUNT(*) as callCount,
@@ -718,7 +754,7 @@ export class DashboardService {
           AND step_type = 'TOOL_EXECUTION' AND tool_name IS NOT NULL
         GROUP BY tool_name
         ORDER BY callCount DESC
-      `).all(actualThreadId, effectiveId, actualThreadId, effectiveId) as any[];
+      `).all(rawSessionId, effectiveId, rawSessionId, effectiveId) as any[];
 
       const toolSummary = toolSummaryRows.map((r) => ({
         toolName: r.tool_name,
@@ -729,47 +765,59 @@ export class DashboardService {
       }));
 
       const sumTurnsDuration = turns.reduce((acc, t) => acc + t.durationMs, 0);
-      threadItem.totalTurns = turns.length;
-      threadItem.totalSteps = stepRows.length + Array.from(childStepsMap.values()).reduce((acc, s) => acc + s.length, 0);
-      threadItem.durationMs = Math.max(Number(threadRow.total_duration_ms || 0), sumTurnsDuration);
+      sessionItem.totalTurns = turns.length;
+      sessionItem.totalSteps = stepRows.length + Array.from(childStepsMap.values()).reduce((acc, s) => acc + s.length, 0);
+      sessionItem.durationMs = Math.max(Number(sessionRow.total_duration_ms || 0), sumTurnsDuration);
 
       return {
-        thread: threadItem,
-        parentThread,
+        session: sessionItem,
+        thread: sessionItem, // backward compat
+        parentSession,
+        parentThread: parentSession ? {
+          threadId: parentSession.sessionId,
+          sessionId: parentSession.sessionId,
+          prompt: parentSession.prompt,
+          role: parentSession.role,
+        } : undefined,
         turns,
         toolSummary,
         subagentsSummary,
       };
     } catch (err) {
-      console.error(`[DashboardService] Error getting thread detail for ${threadId}:`, err);
+      console.error(`[DashboardService] Error getting session detail for ${sessionId}:`, err);
       return null;
     } finally {
       db.close();
     }
   }
 
+  public static getThreadDetail = (requestedDb?: string, threadId?: string) => DashboardService.getSessionDetail(requestedDb, threadId || '');
+
   /**
-   * Updates thread status (e.g. marking interrupted RUNNING threads as SUSPENDED).
+   * Updates session status (e.g. marking interrupted RUNNING sessions as SUSPENDED).
    */
-  public static updateThreadStatus(requestedDb: string | undefined, threadId: string, status: string): boolean {
+  public static updateSessionStatus(requestedDb: string | undefined, sessionId: string, status: string): boolean {
     const dbPath = this.resolveDbPath(requestedDb);
     const db = this.openDb(dbPath);
     if (!db) return false;
     try {
-      const mappedId = threadId.startsWith('task_') ? threadId.replace(/^task_/, 'session_') : (threadId.startsWith('session_') ? threadId.replace(/^session_/, 'task_') : threadId);
+      const mappedId = sessionId.startsWith('task_') ? sessionId.replace(/^task_/, 'session_') : (sessionId.startsWith('session_') ? sessionId.replace(/^session_/, 'task_') : sessionId);
       const stmt = db.prepare('UPDATE threads SET current_state = ?, updated_at = ? WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ?');
-      stmt.run(status, Date.now(), threadId, threadId, mappedId, mappedId);
+      stmt.run(status, Date.now(), sessionId, sessionId, mappedId, mappedId);
       return true;
     } catch (err) {
-      console.error(`[DashboardService] Error updating status for ${threadId}:`, err);
+      console.error(`[DashboardService] Error updating status for ${sessionId}:`, err);
       return false;
     } finally {
       db.close();
     }
   }
 
+  public static updateThreadStatus = (requestedDb: string | undefined, threadId: string, status: string) =>
+    DashboardService.updateSessionStatus(requestedDb, threadId, status);
+
   /**
-   * Deletes a single session and all associated threads, turns, steps, events, and artifacts.
+   * Deletes a single session and all associated data, turns, steps, events, and artifacts.
    */
   public static deleteSession(requestedDb: string | undefined, sessionId: string): boolean {
     const dbPath = this.resolveDbPath(requestedDb);
@@ -781,20 +829,20 @@ export class DashboardService {
         ? sessionId.replace(/^task_/, 'session_')
         : (sessionId.startsWith('session_') ? sessionId.replace(/^session_/, 'task_') : sessionId);
 
-      const threadRows = db.prepare(`
-        SELECT thread_id FROM threads
+      const sessionRows = db.prepare(`
+        SELECT thread_id, session_id FROM threads
         WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ? OR parent_thread_id = ? OR parent_thread_id = ?
-      `).all(sessionId, sessionId, mappedId, mappedId, sessionId, mappedId) as Array<{ thread_id: string }>;
+      `).all(sessionId, sessionId, mappedId, mappedId, sessionId, mappedId) as Array<{ thread_id: string; session_id?: string }>;
 
-      const threadIds = Array.from(new Set([sessionId, mappedId, ...threadRows.map((r) => r.thread_id)]));
+      const targetSessionIds = Array.from(new Set([sessionId, mappedId, ...sessionRows.map((r) => r.thread_id)]));
 
-      for (const tid of threadIds) {
-        db.prepare('DELETE FROM turns WHERE thread_id = ?').run(tid);
-        db.prepare('DELETE FROM steps WHERE thread_id = ?').run(tid);
-        db.prepare('DELETE FROM task_events WHERE thread_id = ?').run(tid);
-        db.prepare('DELETE FROM blackboard_entries WHERE thread_id = ?').run(tid);
-        db.prepare('DELETE FROM artifacts WHERE thread_id = ?').run(tid);
-        db.prepare('DELETE FROM threads WHERE thread_id = ?').run(tid);
+      for (const sid of targetSessionIds) {
+        db.prepare('DELETE FROM turns WHERE thread_id = ?').run(sid);
+        db.prepare('DELETE FROM steps WHERE thread_id = ?').run(sid);
+        db.prepare('DELETE FROM task_events WHERE thread_id = ?').run(sid);
+        db.prepare('DELETE FROM blackboard_entries WHERE thread_id = ?').run(sid);
+        db.prepare('DELETE FROM artifacts WHERE thread_id = ?').run(sid);
+        db.prepare('DELETE FROM threads WHERE thread_id = ?').run(sid);
       }
 
       try {
@@ -810,6 +858,9 @@ export class DashboardService {
       db.close();
     }
   }
+
+  public static deleteThread = (requestedDb: string | undefined, threadId: string) =>
+    DashboardService.deleteSession(requestedDb, threadId);
 
   /**
    * Clears all session, turn, and step data from a database (resets to a clean slate).
@@ -847,30 +898,30 @@ export class DashboardService {
    */
   public static exportFullDatabaseJson(requestedDb?: string): any {
     const summary = this.getDashboardSummary(requestedDb);
-    const threads = this.getThreadList(requestedDb);
-    const detailedThreads: any[] = [];
+    const sessions = this.getSessionList(requestedDb);
+    const detailedSessions: any[] = [];
 
-    for (const root of threads) {
-      const detail = this.getThreadDetail(requestedDb, root.threadId);
+    for (const root of sessions) {
+      const detail = this.getSessionDetail(requestedDb, root.sessionId);
       if (detail) {
-        detailedThreads.push(detail);
+        detailedSessions.push(detail);
       }
       for (const child of root.children) {
-        const childDetail = this.getThreadDetail(requestedDb, child.threadId);
+        const childDetail = this.getSessionDetail(requestedDb, child.sessionId);
         if (childDetail) {
-          detailedThreads.push(childDetail);
+          detailedSessions.push(childDetail);
         }
       }
     }
 
-      return {
-        exportVersion: '1.0',
-        exportedAt: new Date().toISOString(),
-        summary,
-        threads: detailedThreads,
-        sessions: detailedThreads,
-      };
-    }
+    return {
+      exportVersion: '1.0',
+      exportedAt: new Date().toISOString(),
+      summary,
+      sessions: detailedSessions,
+      threads: detailedSessions,
+    };
+  }
 
   /**
    * Resumes a session (either with a follow-up prompt or continuing from checkpoint).
@@ -940,9 +991,4 @@ export class DashboardService {
       return { success: false, sessionId, message: err.message || String(err) };
     }
   }
-
-  // Conceptual aliases for Thread -> Session
-  public static getSessionList = (requestedDb?: string) => DashboardService.getThreadList(requestedDb);
-  public static getSessionDetail = (requestedDb?: string, sessionId?: string) => DashboardService.getThreadDetail(requestedDb, sessionId || '');
-  public static updateSessionStatus = (requestedDb: string | undefined, sessionId: string, status: string) => DashboardService.updateThreadStatus(requestedDb, sessionId, status);
 }

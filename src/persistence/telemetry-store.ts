@@ -17,6 +17,7 @@ export interface TokenUsage {
 export interface StepRecord {
   stepId: string;
   turnId: string;
+  sessionId?: string;
   threadId: string;
   stepIndex: number;
   stepType: StepType;
@@ -32,6 +33,7 @@ export interface StepRecord {
 
 export interface TurnRecord {
   turnId: string;
+  sessionId?: string;
   threadId: string;
   turnIndex: number;
   turnType: TurnType;
@@ -61,6 +63,8 @@ export interface ThreadRecord {
   errorMessage?: string;
 }
 
+export type SessionRecord = ThreadRecord;
+
 export interface ToolMetricItem {
   toolName: string;
   callCount: number;
@@ -77,6 +81,7 @@ export interface StepTypeDistributionItem {
 }
 
 export interface ThreadMetricsReport {
+  sessionId?: string;
   threadId: string;
   status: string;
   prompt: string;
@@ -103,6 +108,8 @@ export interface ThreadMetricsReport {
     summary?: string;
   }>;
 }
+
+export type SessionMetricsReport = ThreadMetricsReport;
 
 export class TelemetryStore {
   constructor(private readonly db: AgentDatabase) {}

@@ -142,6 +142,65 @@ export class AgentDatabase {
           deleted INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_acp_sessions_cwd ON acp_sessions(cwd);
+
+        -- Canonical views for modern session abstraction
+        CREATE VIEW IF NOT EXISTS sessions AS
+        SELECT
+          thread_id AS session_id,
+          parent_thread_id AS parent_session_id,
+          current_state,
+          current_turn_id,
+          prompt,
+          workspace_path,
+          created_at,
+          updated_at,
+          completed_at,
+          total_duration_ms,
+          total_prompt_tokens,
+          total_completion_tokens,
+          total_tokens,
+          total_turns,
+          total_steps,
+          error_message
+        FROM threads;
+
+        CREATE VIEW IF NOT EXISTS session_turns AS
+        SELECT
+          turn_id,
+          thread_id AS session_id,
+          turn_index,
+          turn_type,
+          milestone_id,
+          status,
+          started_at,
+          completed_at,
+          duration_ms,
+          prompt_tokens,
+          completion_tokens,
+          total_tokens,
+          step_count,
+          summary,
+          user_prompt
+        FROM turns;
+
+        CREATE VIEW IF NOT EXISTS session_steps AS
+        SELECT
+          step_id,
+          turn_id,
+          thread_id AS session_id,
+          step_index,
+          step_type,
+          tool_name,
+          status,
+          started_at,
+          completed_at,
+          duration_ms,
+          prompt_tokens,
+          completion_tokens,
+          total_tokens,
+          error_message,
+          metadata
+        FROM steps;
       `);
 
       // Safe schema migration for existing databases
