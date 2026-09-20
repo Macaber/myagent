@@ -231,53 +231,145 @@ export const grepTool: AgentTool<{ pattern: string; dirPath?: string; caseSensit
 // =================== 6. glob ===================
 export const globTool: AgentTool<{ pattern: string; dirPath?: string }> = {
   name: 'glob',
-  description: 'Search for files matching a pattern (e.g. **/*.ts, src/**/*.json), sorted by modification time.',
+  description:
+    'List directory contents or search for files/directories matching a pattern (e.g. "*", ".*", "src/*", "**/*.ts", "*.json"). ' +
+    'Returns items marked with [DIR] or [FILE]. Use pattern "*" to list top-level files and directories.',
   riskLevel: 'READ_ONLY',
   parameters: {
     type: 'object',
     properties: {
-      pattern: { type: 'string', description: 'File pattern or extension (e.g. **/*.ts, *.json)' },
-      dirPath: { type: 'string', description: 'Directory to search within (defaults to workspace root)' },
+      pattern: {
+        type: 'string',
+        description: 'File/directory pattern (e.g. "*", ".*", "src/*", "**/*.ts", "*.json")',
+      },
+      dirPath: {
+        type: 'string',
+        description: 'Directory to search within (defaults to workspace root)',
+      },
     },
     required: ['pattern'],
   },
   async execute(params, context) {
-    const searchRoot = params.dirPath
+    const rawRoot = params.dirPath
       ? context.workspaceJail.resolvePath(params.dirPath)
       : context.workspaceJail.getWorkspaceRoot();
 
-    const extMatch = params.pattern.match(/\.([a-zA-Z0-9]+)$/);
-    const targetExt = extMatch ? `.${extMatch[1]}` : undefined;
+    if (!fs.existsSync(rawRoot)) {
+      throw new Error(`Directory not found: ${params.dirPath || '.'}`);
+    }
 
-    const matchedFiles: Array<{ relPath: string; mtime: number }> = [];
+    const pattern = (params.pattern || '*').trim();
+    const isRecursive = pattern.includes('**');
+    const isTopLevel = pattern === '*' || pattern === '.*' || pattern === './*' || pattern === '.';
 
-    function walk(dir: string) {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
+    // Check if pattern targets a specific subdirectory, e.g. "src/*" or "scripts/*"
+    const slashIdx = pattern.lastIndexOf('/');
+    let searchDir = rawRoot;
+    let filePattern = pattern;
+
+    if (slashIdx !== -1 && !isRecursive) {
+      const subDirPart = pattern.slice(0, slashIdx);
+      filePattern = pattern.slice(slashIdx + 1) || '*';
+      const resolvedSubDir = path.resolve(rawRoot, subDirPart);
+      if (fs.existsSync(resolvedSubDir) && fs.statSync(resolvedSubDir).isDirectory()) {
+        searchDir = resolvedSubDir;
+      }
+    }
+
+    const isTopDirList = isTopLevel || filePattern === '*' || filePattern === '.*';
+
+    // 1. Top-level directory listing (non-recursive)
+    if (!isRecursive && isTopDirList) {
+      const entries = fs.readdirSync(searchDir, { withFileTypes: true });
+      const includeHidden = pattern.startsWith('.') || filePattern.startsWith('.') || pattern === '*';
+
+      const dirs: string[] = [];
+      const files: string[] = [];
+
       for (const entry of entries) {
-        if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'dist') continue;
-        const full = path.join(dir, entry.name);
+        if (entry.name === '.git') continue; // Always hide internal .git unless explicitly asked
+        if (!includeHidden && entry.name.startsWith('.')) continue;
+
+        const relPath = path.relative(context.workspaceJail.getWorkspaceRoot(), path.join(searchDir, entry.name));
+        const displayName = relPath || entry.name;
+
         if (entry.isDirectory()) {
-          walk(full);
+          dirs.push(`[DIR]  ${displayName}/`);
+        } else {
+          files.push(`[FILE] ${displayName}`);
+        }
+      }
+
+      dirs.sort((a, b) => a.localeCompare(b));
+      files.sort((a, b) => a.localeCompare(b));
+
+      const allItems = [...dirs, ...files];
+      if (allItems.length === 0) {
+        return `Directory ${path.relative(context.workspaceJail.getWorkspaceRoot(), searchDir) || '.'} is empty.`;
+      }
+
+      const dirLabel = path.relative(context.workspaceJail.getWorkspaceRoot(), searchDir) || '.';
+      return `Listing ${allItems.length} item(s) in '${dirLabel}':\n` + allItems.join('\n');
+    }
+
+    // 2. Recursive or pattern-filtered file search
+    const extMatch = pattern.match(/\.([a-zA-Z0-9]+)$/);
+    const targetExt = extMatch ? `.${extMatch[1]}` : undefined;
+    const nameMatchPattern = filePattern !== '*' && filePattern !== '**/*' ? filePattern.replace(/\*/g, '.*') : undefined;
+    const nameRegex = nameMatchPattern ? new RegExp(`^${nameMatchPattern}$`, 'i') : undefined;
+
+    const matchedItems: Array<{ relPath: string; isDir: boolean; mtime: number }> = [];
+
+    function walk(dir: string, currentDepth: number = 0) {
+      if (!isRecursive && currentDepth > 0) return;
+
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === 'dist') continue;
+        if (!pattern.startsWith('.') && entry.name.startsWith('.')) continue;
+
+        const full = path.join(dir, entry.name);
+        const relPath = path.relative(rawRoot, full);
+
+        if (entry.isDirectory()) {
+          if (isRecursive) {
+            walk(full, currentDepth + 1);
+          } else {
+            if (!targetExt && (!nameRegex || nameRegex.test(entry.name))) {
+              matchedItems.push({ relPath: `${relPath}/`, isDir: true, mtime: Date.now() });
+            }
+          }
         } else if (entry.isFile()) {
-          if (!targetExt || full.endsWith(targetExt)) {
-            const stat = fs.statSync(full);
-            matchedFiles.push({
-              relPath: path.relative(searchRoot, full),
-              mtime: stat.mtimeMs,
-            });
+          const extMatches = !targetExt || full.endsWith(targetExt);
+          const nameMatches = !nameRegex || nameRegex.test(entry.name);
+          if (extMatches && nameMatches) {
+            try {
+              const stat = fs.statSync(full);
+              matchedItems.push({ relPath, isDir: false, mtime: stat.mtimeMs });
+            } catch {
+              matchedItems.push({ relPath, isDir: false, mtime: 0 });
+            }
           }
         }
       }
     }
 
-    walk(searchRoot);
-    matchedFiles.sort((a, b) => b.mtime - a.mtime);
+    walk(searchDir, 0);
+    matchedItems.sort((a, b) => b.mtime - a.mtime);
 
-    if (matchedFiles.length === 0) {
-      return `No files found matching pattern: ${params.pattern}`;
+    if (matchedItems.length === 0) {
+      return `No files or directories found matching pattern: ${params.pattern}`;
     }
 
-    return `Matched ${matchedFiles.length} file(s):\n` +
-      matchedFiles.slice(0, 50).map((f) => f.relPath).join('\n');
+    const preview = matchedItems.slice(0, 60).map((f) => (f.isDir ? `[DIR]  ${f.relPath}` : `[FILE] ${f.relPath}`));
+    const truncatedNote = matchedItems.length > 60 ? `\n... (${matchedItems.length - 60} more items omitted)` : '';
+
+    return `Found ${matchedItems.length} match(es) for pattern '${params.pattern}':\n` + preview.join('\n') + truncatedNote;
   },
 };

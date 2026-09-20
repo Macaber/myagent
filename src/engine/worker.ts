@@ -55,7 +55,10 @@ export class WorkerAgent {
       },
     ];
 
-    const loopDetector = new LoopDetector(10, 2);
+    const maxStepsPerTurn = Number(process.env.MAX_STEPS_PER_TURN) || 60;
+    const maxModelIterations = Number(process.env.MAX_MODEL_ITERATIONS) || 12;
+    const loopDetector = new LoopDetector(maxStepsPerTurn, 2, maxModelIterations);
+    let forcedAnswerAttempt = false;
 
     // If no LLM provider (offline/mock mode), perform direct mock execution
     if (!this.provider) {
@@ -95,20 +98,56 @@ export class WorkerAgent {
           throw new Error('Milestone execution aborted by client');
         }
 
-        // Check Circuit Breaker
+        loopDetector.recordModelIteration();
+        const budgetStatus = loopDetector.getBudgetStatus();
+
+        // Check Circuit Breaker for dead loops or oscillation
         const breaker = loopDetector.checkCircuitBreaker();
         if (breaker.tripped) {
-          return {
-            status: 'BLOCKED',
-            summary: `Circuit breaker tripped during milestone '${milestone.id}'.`,
-            error: breaker.reason,
-            remedySuggestion: 'Inspect the dead-loop error and supply guidance or manually fix conflict.',
-          };
+          // If dead-loop or cognitive oscillation, block immediately
+          if (breaker.reason?.includes('dead-loop') || breaker.reason?.includes('oscillation')) {
+            return {
+              status: 'BLOCKED',
+              summary: `Circuit breaker tripped during milestone '${milestone.id}'.`,
+              error: breaker.reason,
+              remedySuggestion: 'Inspect the dead-loop error and supply guidance or manually fix conflict.',
+            };
+          }
+
+          // If budget exhaustion happened after a forced answer was already attempted, block
+          if (forcedAnswerAttempt) {
+            return {
+              status: 'BLOCKED',
+              summary: `Circuit breaker tripped during milestone '${milestone.id}'.`,
+              error: breaker.reason,
+              remedySuggestion: 'Inspect the dead-loop error and supply guidance or manually fix conflict.',
+            };
+          }
+        }
+
+        let isForcingAnswer = false;
+        if (budgetStatus.shouldForceAnswer) {
+          // Graceful degradation: budget reached, disable tools and force final synthesis
+          isForcingAnswer = true;
+          forcedAnswerAttempt = true;
+          localTurnMessages.push({
+            role: 'user',
+            content:
+              '⚠️ [SYSTEM INSTRUCTION - BUDGET REACHED]: Exploration budget is reached. Tools are now DISABLED. ' +
+              'Synthesize your complete and comprehensive final answer based on all information already gathered above.',
+          });
+        } else if (budgetStatus.shouldWarnBudget) {
+          localTurnMessages.push({
+            role: 'user',
+            content:
+              '⚠️ [SYSTEM NOTICE]: Exploration budget for this milestone is nearly exhausted. ' +
+              'Do NOT call additional exploration tools unless strictly necessary. Directly provide your final answer now.',
+          });
         }
 
         // Dynamically get active tools and minimal assembled context
         const isConversational = milestone.title === 'Direct Conversational Response';
-        const activeToolSchemas = isConversational
+        const activeToolSchemas = (isConversational || isForcingAnswer)
           ? undefined
           : this.toolRouter.getActiveToolSchemas(turnContext.turnId, 'worker');
 

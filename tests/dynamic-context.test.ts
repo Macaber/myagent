@@ -16,6 +16,8 @@ import {
   globTool,
 } from '../dist/tools/core-tools.js';
 import { todoWriteTool, questionTool, patchTool, skillTool } from '../dist/tools/extended-tools.js';
+import { OpenAIProvider } from '../dist/provider/openai-provider.js';
+import { WorkspaceJail } from '../dist/security/workspace-jail.js';
 
 describe('Dynamic Context & On-Demand Capabilities Engine', () => {
   function setupRegistry() {
@@ -258,5 +260,89 @@ describe('Dynamic Context & On-Demand Capabilities Engine', () => {
     assert.ok(prompt.includes('=== CURRENT TODO CHECKLIST ==='));
     assert.ok(prompt.includes('[COMPLETED] Create gateway class'));
     assert.ok(prompt.includes('[IN_PROGRESS] Write integration test'));
+  });
+
+  test('5. ReAct-Aware Watermark Folding preserves atomic tool call transactions', () => {
+    const compactor = new MemoryCompactor();
+
+    // Construct a realistic conversation with parallel tool calls:
+    // Turn 1: 1 assistant with 3 tool calls + 3 tool responses
+    // Turn 2: 1 assistant with 2 tool calls + 2 tool responses
+    const messages = [
+      { role: 'user', content: 'Explore directory' },
+      {
+        role: 'assistant',
+        content: 'I will list and read',
+        tool_calls: [
+          { id: 'call_1', type: 'function', function: { name: 'glob', arguments: '{}' } },
+          { id: 'call_2', type: 'function', function: { name: 'read', arguments: '{}' } },
+          { id: 'call_3', type: 'function', function: { name: 'read', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: 'A'.repeat(5000) },
+      { role: 'tool', tool_call_id: 'call_2', content: 'B'.repeat(5000) },
+      { role: 'tool', tool_call_id: 'call_3', content: 'C'.repeat(5000) },
+      {
+        role: 'assistant',
+        content: 'Now next step',
+        tool_calls: [
+          { id: 'call_4', type: 'function', function: { name: 'glob', arguments: '{}' } },
+          { id: 'call_5', type: 'function', function: { name: 'read', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'call_4', content: 'D'.repeat(5000) },
+      { role: 'tool', tool_call_id: 'call_5', content: 'E'.repeat(5000) },
+    ];
+
+    // Request keeping 4 recent messages (which would blindly slice into tool_4 / tool_5)
+    const { messages: folded, wasFolded } = compactor.checkWatermarkAndFold(messages as any, 10000, 4);
+    assert.strictEqual(wasFolded, true);
+
+    // After folding, recent messages MUST begin with assistant, NEVER an orphan tool message!
+    const firstFoldedRecent = folded[2];
+    assert.notStrictEqual(firstFoldedRecent.role, 'tool', 'Folded messages must never start with role: tool');
+    assert.strictEqual(firstFoldedRecent.role, 'assistant');
+    assert.strictEqual((firstFoldedRecent as any).tool_calls?.length, 2);
+  });
+
+  test('6. OpenAIProvider.sanitizeMessages prevents 400 errors from orphaned tool messages', () => {
+    // An array containing an orphan tool message with no preceding assistant tool_calls
+    const dirtyMessages: any[] = [
+      { role: 'system', content: 'You are an assistant' },
+      { role: 'user', content: 'List files' },
+      { role: 'tool', tool_call_id: 'orphan_call_1', content: 'Directory contents' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_valid', type: 'function', function: { name: 'read', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_valid', content: 'File contents' },
+    ];
+
+    const sanitized = OpenAIProvider.sanitizeMessages(dirtyMessages);
+
+    // The orphan tool message should be converted to a user message
+    assert.strictEqual(sanitized[2].role, 'user');
+    assert.ok((sanitized[2].content as string).includes('[Previous Tool Execution Result]'));
+
+    // The valid tool message should remain a tool message
+    assert.strictEqual(sanitized[3].role, 'assistant');
+    assert.strictEqual(sanitized[4].role, 'tool');
+    assert.strictEqual(sanitized[4].tool_call_id, 'call_valid');
+  });
+
+  test('7. globTool lists top-level files and directories with [DIR] and [FILE] markers', async () => {
+    const jail = new WorkspaceJail(process.cwd());
+    const context: any = {
+      workspaceJail: jail,
+      threadId: 'test_thread',
+      blackboard: new Blackboard('test_glob'),
+    };
+
+    const result = await globTool.execute({ pattern: '*' }, context);
+    assert.ok(result.includes('[DIR]'));
+    assert.ok(result.includes('[FILE]'));
+    assert.ok(result.includes('package.json'));
+    assert.ok(result.includes('src'));
   });
 });

@@ -32,12 +32,13 @@ export class DynamicContextAssembler {
 Operating Principles:
 1. Conversational & Informational requests: If the user is greeting you (e.g. "你好", "hello"), asking a question, seeking clarification, or having a chat, answer DIRECTLY and politely in markdown. DO NOT call tools (especially do not run 'bash' or inspect files) for greetings or general questions.
 2. Tool Selection & Safety:
-   - For listing files or finding directory structure: ALWAYS use 'glob' (e.g. pattern 'tests/*'). NEVER use 'bash' (e.g. ls, find) to list files when 'glob' is available.
+   - For listing files or finding directory structure: ALWAYS use 'glob' with pattern '*' to view top-level files and directories (or 'src/*', 'tests/*' for subdirectories). 'glob' returns [DIR] and [FILE] markers directly in 1 step. NEVER use 'bash' (e.g. ls, find) to list files when 'glob' is available.
    - For searching text in codebase: ALWAYS use 'grep'.
    - For reading files: ALWAYS use 'read'.
    - For editing or creating files: Use 'edit' or 'write'.
    - 'bash' requires strict human approval: Reserve 'bash' ONLY for running build scripts (npm run build), test suites (npm test), git commands, or commands explicitly requested by the user.
-3. Clarity and Conciseness: Provide direct, clear, and helpful answers.`
+3. Clarity and Conciseness: Provide direct, clear, and helpful answers.
+4. Project Overview & Explanation Discipline: For questions asking about project purpose, architecture, or codebase overview (e.g. "这个项目是干什么的", "项目结构介绍"): Inspecting 1-2 high-level files (such as README.md, package.json, or top-level directory listing) is SUFFICIENT. You MUST immediately synthesize and deliver the final answer once the main purpose and stack are identified. DO NOT recursively inspect or read implementation files line-by-line.`
     );
 
     // 2. Goal & Budget Invariant Anchor
@@ -127,7 +128,7 @@ Operating Principles:
     const recent = params.recentMessages || [];
     const { messages: foldedMessages } = this.compactor.checkWatermarkAndFold(
       recent,
-      params.maxCharacters ?? 24000,
+      params.maxCharacters ?? (Number(process.env.MAX_CONTEXT_CHARACTERS) || 64000),
       6
     );
 

@@ -7,14 +7,53 @@ export interface ActionFingerprint {
   timestamp: number;
 }
 
+export interface BudgetStatus {
+  modelIterations: number;
+  maxModelIterations: number;
+  toolExecutions: number;
+  maxToolExecutions: number;
+  shouldWarnBudget: boolean;
+  shouldForceAnswer: boolean;
+}
+
 export class LoopDetector {
   private history: ActionFingerprint[] = [];
   private editTargetHistory: string[] = []; // Tracks modified file keys for oscillation detection
+  private modelIterations: number = 0;
 
   constructor(
-    private readonly maxStepsPerTurn: number = 10,
-    private readonly maxConsecutiveSameAction: number = 2
+    private readonly maxStepsPerTurn: number = Number(process.env.MAX_STEPS_PER_TURN) || 60,
+    private readonly maxConsecutiveSameAction: number = 2,
+    private readonly maxModelIterations: number = Number(process.env.MAX_MODEL_ITERATIONS) || 12
   ) {}
+
+  public recordModelIteration(): void {
+    this.modelIterations++;
+  }
+
+  public getModelIterations(): number {
+    return this.modelIterations;
+  }
+
+  public getBudgetStatus(): BudgetStatus {
+    const warnIterations = Math.max(1, Math.floor(this.maxModelIterations * 0.7));
+    const warnTools = Math.max(1, Math.floor(this.maxStepsPerTurn * 0.7));
+
+    const shouldWarnBudget =
+      this.modelIterations >= warnIterations || this.history.length >= warnTools;
+
+    const shouldForceAnswer =
+      this.modelIterations >= this.maxModelIterations || this.history.length >= this.maxStepsPerTurn;
+
+    return {
+      modelIterations: this.modelIterations,
+      maxModelIterations: this.maxModelIterations,
+      toolExecutions: this.history.length,
+      maxToolExecutions: this.maxStepsPerTurn,
+      shouldWarnBudget,
+      shouldForceAnswer,
+    };
+  }
 
   public recordAction(toolName: string, rawParams: any, failed: boolean): void {
     const paramsStr = typeof rawParams === 'string' ? rawParams : JSON.stringify(rawParams);

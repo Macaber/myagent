@@ -36,6 +36,12 @@ export const Header: React.FC<HeaderProps> = ({
             ⏸ BLOCKED (APPROVAL)
           </Text>
         );
+      case 'SUSPENDED_INPUT':
+        return (
+          <Text color="yellow" bold>
+            ⏸ WAITING INPUT
+          </Text>
+        );
       case 'COMPLETED':
         return (
           <Text color="green" bold>

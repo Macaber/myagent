@@ -26,6 +26,56 @@ export class OpenAIProvider {
     return this.model;
   }
 
+  /**
+   * Sanitizes the messages array to strictly conform to OpenAI Chat Completions API rules:
+   * 1. A message with role 'tool' MUST be preceded by an assistant message with 'tool_calls'
+   *    containing a matching tool_call id.
+   * 2. If an assistant message specifies 'tool_calls', all corresponding tool responses must be provided.
+   * 3. Any orphan tool messages (e.g. from context truncation or bad slicing) are safely converted to
+   *    informational user messages so they preserve context without causing HTTP 400.
+   */
+  public static sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
+    const sanitized: ChatMessage[] = [];
+    let pendingToolCallIds = new Set<string>();
+
+    for (const msg of messages) {
+      if (msg.role === 'tool') {
+        const toolId = msg.tool_call_id;
+        if (toolId && pendingToolCallIds.has(toolId)) {
+          sanitized.push(msg);
+          pendingToolCallIds.delete(toolId);
+        } else {
+          // Orphan tool message: convert to user message
+          sanitized.push({
+            role: 'user',
+            content: `[Previous Tool Execution Result]: ${typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)}`,
+          });
+        }
+      } else {
+        // If previous assistant message had tool calls that were never answered before this new message,
+        // fill them with placeholder tool responses so OpenAI doesn't reject
+        if (pendingToolCallIds.size > 0) {
+          for (const missingId of pendingToolCallIds) {
+            sanitized.push({
+              role: 'tool',
+              tool_call_id: missingId,
+              content: '[Tool output omitted or skipped]',
+            });
+          }
+          pendingToolCallIds.clear();
+        }
+
+        if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+          pendingToolCallIds = new Set(msg.tool_calls.map((tc) => tc.id).filter(Boolean));
+        }
+
+        sanitized.push(msg);
+      }
+    }
+
+    return sanitized;
+  }
+
   public async *chatStream(params: {
     messages: ChatMessage[];
     tools?: ToolSchema[];
@@ -39,6 +89,7 @@ export class OpenAIProvider {
       modelsToTry.push(this.fallbackModel);
     }
 
+    const sanitizedMessages = OpenAIProvider.sanitizeMessages(params.messages);
     let lastError: Error | null = null;
 
     for (const currentModel of modelsToTry) {
@@ -50,7 +101,7 @@ export class OpenAIProvider {
         try {
           const body: Record<string, any> = {
             model: currentModel,
-            messages: params.messages,
+            messages: sanitizedMessages,
             stream: true,
             stream_options: { include_usage: true },
             temperature: params.temperature ?? 0.2,

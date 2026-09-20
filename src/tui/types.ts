@@ -1,6 +1,6 @@
 import { PermissionRiskLevel } from '../protocol/types.js';
 
-export type AgentRuntimeState = 'IDLE' | 'PENDING' | 'RUNNING' | 'BLOCKED' | 'COMPLETED' | 'FAILED';
+export type AgentRuntimeState = 'IDLE' | 'PENDING' | 'RUNNING' | 'BLOCKED' | 'SUSPENDED_INPUT' | 'COMPLETED' | 'FAILED';
 
 export interface MilestoneItem {
   id: string;

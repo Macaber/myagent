@@ -79,7 +79,7 @@ export class MemoryCompactor {
    * Token Watermark Check: If messages exceed the soft token budget, fold older messages
    * into a compact historical summary while preserving system prompt, goal anchor, and recent turns.
    */
-  public checkWatermarkAndFold<T extends { role: string; content?: any }>(
+  public checkWatermarkAndFold<T extends { role: string; content?: any; tool_call_id?: string; tool_calls?: any[] }>(
     messages: T[],
     maxCharacters: number = 32000,
     keepRecentCount: number = 6
@@ -92,8 +92,32 @@ export class MemoryCompactor {
 
     // Preserve first message (System/Goal prompt) and last keepRecentCount messages
     const firstMsg = messages[0];
-    const recentMsgs = messages.slice(-keepRecentCount);
-    const middleMsgs = messages.slice(1, -keepRecentCount);
+    let splitIndex = Math.max(1, messages.length - keepRecentCount);
+
+    // CRITICAL: Ensure splitIndex does NOT cut inside a tool call transaction!
+    // A role: 'tool' message must never appear without its preceding assistant tool_calls message.
+    // First attempt: backtrack to include the assistant message that initiated the tool call.
+    let candidate = splitIndex;
+    while (candidate > 1 && messages[candidate].role === 'tool') {
+      candidate--;
+    }
+
+    if (candidate > 1) {
+      splitIndex = candidate;
+    } else {
+      // If backtracking would consume all earlier messages, advance forward to the next turn boundary
+      while (splitIndex < messages.length && messages[splitIndex].role === 'tool') {
+        splitIndex++;
+      }
+    }
+
+    // If no valid split boundary exists that allows folding earlier messages, don't fold
+    if (splitIndex <= 1 || splitIndex >= messages.length) {
+      return { messages, wasFolded: false };
+    }
+
+    const recentMsgs = messages.slice(splitIndex);
+    const middleMsgs = messages.slice(1, splitIndex);
 
     const foldedSummaryContent = `[CONTEXT COMPACTED: Folded ${middleMsgs.length} earlier intermediate reasoning steps and tool outputs to preserve token budget. Core decisions and outputs remain recorded in Blackboard.]`;
 

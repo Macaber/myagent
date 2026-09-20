@@ -58,24 +58,30 @@ export const InputBar: React.FC<InputBarProps> = ({
     );
   }
 
+  const isSuspended = state === 'SUSPENDED_INPUT';
+  const borderColor = isSuspended ? 'yellow' : 'green';
+  const placeholder = isSuspended
+    ? '任务已挂起并等待输入，请输入补充指令继续执行 (/help 查看帮助)'
+    : '输入任务需求或指令，按回车执行 (/help 查看帮助)';
+
   return (
     <Box
       borderStyle="round"
-      borderColor="green"
+      borderColor={borderColor}
       paddingX={1}
       marginY={0}
       flexDirection="column"
     >
       <Box flexDirection="row" gap={1}>
-        <Text bold color="green">
-          ❯
+        <Text bold color={borderColor}>
+          {isSuspended ? '⏸ ❯' : '❯'}
         </Text>
         <TextInput
           value={value}
           onChange={setValue}
           onSubmit={handleSubmit}
           focus={Boolean(process.stdin.isTTY)}
-          placeholder="输入任务需求或指令，按回车执行 (/help 查看帮助)"
+          placeholder={placeholder}
         />
       </Box>
     </Box>

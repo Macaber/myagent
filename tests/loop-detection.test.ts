@@ -47,4 +47,51 @@ describe('Loop & Oscillation Detection Circuit Breaker', () => {
     assert.strictEqual(breaker.tripped, true);
     assert.match(breaker.reason!, /Turn step budget exhausted/);
   });
+
+  test('Defaults to 60 steps per turn budget', () => {
+    const detector = new LoopDetector();
+    for (let i = 0; i < 59; i++) {
+      detector.recordAction('read', { filePath: `file_${i}.ts` }, false);
+      assert.strictEqual(detector.checkCircuitBreaker().tripped, false);
+    }
+    detector.recordAction('read', { filePath: 'file_59.ts' }, false);
+    const breaker = detector.checkCircuitBreaker();
+    assert.strictEqual(breaker.tripped, true);
+    assert.match(breaker.reason!, /60\/60 steps/);
+  });
+
+  test('Tracks model iterations and provides two-stage budget status', () => {
+    const detector = new LoopDetector(60, 2, 10);
+    // 0 iterations: neither warn nor force
+    assert.strictEqual(detector.getBudgetStatus().shouldWarnBudget, false);
+    assert.strictEqual(detector.getBudgetStatus().shouldForceAnswer, false);
+
+    // Record up to 7 iterations (70% of 10) -> should warn
+    for (let i = 0; i < 7; i++) {
+      detector.recordModelIteration();
+    }
+    assert.strictEqual(detector.getBudgetStatus().shouldWarnBudget, true);
+    assert.strictEqual(detector.getBudgetStatus().shouldForceAnswer, false);
+
+    // Record up to 10 iterations -> should force answer
+    for (let i = 0; i < 3; i++) {
+      detector.recordModelIteration();
+    }
+    assert.strictEqual(detector.getBudgetStatus().shouldForceAnswer, true);
+  });
+
+  test('Respects MAX_STEPS_PER_TURN env variable', () => {
+    process.env.MAX_STEPS_PER_TURN = '5';
+    try {
+      const detector = new LoopDetector();
+      for (let i = 0; i < 4; i++) {
+        detector.recordAction('read', { filePath: `f_${i}.ts` }, false);
+        assert.strictEqual(detector.checkCircuitBreaker().tripped, false);
+      }
+      detector.recordAction('read', { filePath: 'f_4.ts' }, false);
+      assert.strictEqual(detector.checkCircuitBreaker().tripped, true);
+    } finally {
+      delete process.env.MAX_STEPS_PER_TURN;
+    }
+  });
 });

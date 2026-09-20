@@ -853,12 +853,14 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         } as any;
       }
 
+      const lastTurn = (report as any).turnsBreakdown?.[(report as any).turnsBreakdown?.length - 1];
+      const blockedDetail = lastTurn?.summary ? ` (${lastTurn.summary})` : '';
       const summaryText =
         report.status === 'COMPLETED'
           ? 'Task completed successfully'
           : report.status === 'SUSPENDED_INPUT'
-          ? 'Execution blocked: requires user input'
-          : `Execution failed: ${report.status}`;
+          ? `Execution blocked / suspended${blockedDetail}`
+          : `Execution failed: ${report.status}${blockedDetail}`;
 
       const stopReason: StopReason =
         report.status === 'COMPLETED'
@@ -875,6 +877,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
       session.history.push(agentChunk);
       dispatcher.emitSessionUpdate({
         sessionId: params.sessionId,
+        updateType: 'agent_message_chunk',
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: summaryText },
+        data: { text: summaryText },
         update: agentChunk,
       });
 

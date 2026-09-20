@@ -80,8 +80,11 @@ export const App: React.FC<AppProps> = ({
     });
 
     // Session update listener
-    const unsubscribeUpdates = client.onSessionUpdate((notif) => {
-      const { updateType, data, content } = notif;
+    const unsubscribeUpdates = client.onSessionUpdate((notif: any) => {
+      const update = notif?.update || notif;
+      const updateType = notif?.updateType || update?.sessionUpdate || update?.updateType || notif?.sessionUpdate;
+      const data = notif?.data || update?.data || update;
+      const content = notif?.content || update?.content;
 
       // State Changed
       if (updateType === 'state_changed') {
@@ -126,8 +129,8 @@ export const App: React.FC<AppProps> = ({
       }
 
       // Thought chunk
-      if (updateType === 'agent_thought_chunk' || notif.sessionUpdate === 'agent_thought_chunk') {
-        const delta = data?.text || content?.text || '';
+      if (updateType === 'agent_thought_chunk' || notif?.sessionUpdate === 'agent_thought_chunk' || update?.sessionUpdate === 'agent_thought_chunk') {
+        const delta = data?.text || (typeof content === 'string' ? content : content?.text) || '';
         if (delta) {
           setMessages((prev) => {
             if (currentThoughtMessageId.current) {
@@ -153,8 +156,8 @@ export const App: React.FC<AppProps> = ({
       }
 
       // Message chunk (Agent speech)
-      if (updateType === 'agent_message_chunk' || notif.sessionUpdate === 'agent_message_chunk') {
-        const delta = data?.text || content?.text || '';
+      if (updateType === 'agent_message_chunk' || notif?.sessionUpdate === 'agent_message_chunk' || update?.sessionUpdate === 'agent_message_chunk') {
+        const delta = data?.text || (typeof content === 'string' ? content : content?.text) || '';
         if (delta) {
           // Reset thought cursor since agent has moved to speech
           currentThoughtMessageId.current = null;
@@ -370,6 +373,17 @@ export const App: React.FC<AppProps> = ({
       const result = await client.promptSession(sessionId, text);
       if (result.status === 'completed') {
         setState('COMPLETED');
+      } else if (result.status === 'blocked' || result.stopReason === 'requires_action') {
+        setState('SUSPENDED_INPUT');
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `sys_${Date.now()}`,
+            type: 'system',
+            content: `⏸ 任务执行挂起: ${result.summary || '等待用户输入下一步指令'}`,
+            timestamp: Date.now(),
+          },
+        ]);
       } else if (result.status === 'error') {
         setState('FAILED');
       }
