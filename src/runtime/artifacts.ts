@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Blackboard } from '../context/blackboard.js';
 import { ThreadMetricsReport } from '../persistence/telemetry-store.js';
+import { getTasksDir } from '../config/paths.js';
 
 export class ArtifactManager {
   public static saveRunSummary(
@@ -10,7 +11,7 @@ export class ArtifactManager {
     report: ThreadMetricsReport,
     blackboard: Blackboard
   ): string {
-    const summaryDir = path.join(workspaceRoot, '.agent', 'tasks', threadId);
+    const summaryDir = path.join(getTasksDir(), threadId);
     if (!fs.existsSync(summaryDir)) {
       fs.mkdirSync(summaryDir, { recursive: true });
     }

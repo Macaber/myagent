@@ -18,6 +18,15 @@ export class ToolRouter {
     summary: ['read', 'todowrite', 'question'],
   };
 
+  // Fine-grained tool presets by worker role / skill to minimize schema token overhead
+  private skillPresets: Record<string, string[]> = {
+    explore: ['read', 'glob', 'grep', 'question', 'skill'],
+    analyst: ['read', 'glob', 'grep', 'question', 'skill', 'invoke_subagent'],
+    coder: ['read', 'edit', 'write', 'patch', 'glob', 'grep', 'question', 'skill'],
+    developer: ['read', 'edit', 'write', 'patch', 'bash', 'glob', 'grep', 'todowrite', 'question', 'skill', 'invoke_subagent'],
+    qa: ['bash', 'read', 'grep', 'glob', 'todowrite', 'question', 'skill'],
+  };
+
   // Turn-specific dynamically activated tools
   private turnActivatedTools = new Map<string, Set<string>>();
 
@@ -85,15 +94,19 @@ export class ToolRouter {
 
   /**
    * Get active tool schemas for the current step/turn, combining:
-   * 1. Stage preset tools (filtered to registered ones)
+   * 1. Stage preset tools or skill-specific tools (filtered to registered ones)
    * 2. Turn-specifically activated tools (e.g. dynamically requested MCP tools)
    * 3. Meta-tools (search_tools, activate_tool)
    */
-  public getActiveToolSchemas(turnId?: string, stage: StageType = 'worker'): ToolSchema[] {
+  public getActiveToolSchemas(turnId?: string, stage: StageType = 'worker', assignedSkill?: string): ToolSchema[] {
     const activeNames = new Set<string>();
 
-    // 1. Add stage base tools
-    const preset = this.stagePresets[stage] || this.stagePresets.worker;
+    // 1. Add stage base tools or skill-tailored tools
+    let preset = this.stagePresets[stage] || this.stagePresets.worker;
+    if (stage === 'worker' && assignedSkill && this.skillPresets[assignedSkill]) {
+      preset = this.skillPresets[assignedSkill];
+    }
+
     for (const name of preset) {
       if (this.registry.hasTool(name) && !this.isDeferred(name)) {
         activeNames.add(name);

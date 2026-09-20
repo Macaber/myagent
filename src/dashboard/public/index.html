@@ -1,0 +1,1335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MyAgent Telemetry & Execution Inspector</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              400: '#818cf8',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+              900: '#312e81',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Custom scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #18181b; }
+    ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+    .tree-line { border-left: 2px dashed #3f3f46; }
+    .code-scroll { max-height: 240px; }
+  </style>
+</head>
+<body class="bg-zinc-950 text-zinc-100 h-screen flex flex-col overflow-hidden font-sans antialiased selection:bg-indigo-500 selection:text-white">
+
+  <!-- Top Header Navigation -->
+  <header class="border-b border-zinc-800 bg-zinc-900/90 backdrop-blur sticky top-0 z-50 px-6 py-3 flex items-center justify-between shadow-lg">
+    <div class="flex items-center space-x-3">
+      <div class="h-9 w-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center shadow-indigo-500/20 shadow-md">
+        <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+        </svg>
+      </div>
+      <div>
+        <div class="flex items-center space-x-2">
+          <h1 class="text-base font-bold tracking-tight text-white">MyAgent Telemetry</h1>
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-indigo-900/50 text-indigo-300 border border-indigo-700/50">v0.1.0</span>
+          <span id="live-indicator" class="flex h-2 w-2 relative">
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+          </span>
+        </div>
+        <p class="text-xs text-zinc-400">Session · Turn · Step · Token · Tool 微观监控大盘</p>
+      </div>
+    </div>
+
+    <!-- Controls: Database selector, Auto-Refresh, Export, Offline Load -->
+    <div class="flex items-center space-x-3">
+      <!-- Database Select -->
+      <div class="flex items-center space-x-2 bg-zinc-800/80 border border-zinc-700/70 rounded-lg px-2.5 py-1.5 text-xs">
+        <svg class="w-4 h-4 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2 1.5 3 3.5 3h9c2 0 3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3h9c2 0 3.5 1 3.5 3M4 7h16" />
+        </svg>
+        <span class="text-zinc-400 font-medium">数据库:</span>
+        <select id="db-select" class="bg-transparent text-white font-medium focus:outline-none cursor-pointer">
+          <option value="" disabled selected>正在扫描...</option>
+        </select>
+      </div>
+
+      <!-- Auto Refresh Switch -->
+      <div class="flex items-center space-x-2 bg-zinc-800/80 border border-zinc-700/70 rounded-lg px-2.5 py-1.5 text-xs">
+        <label class="flex items-center cursor-pointer space-x-1.5">
+          <input type="checkbox" id="auto-refresh-toggle" class="form-checkbox h-3.5 w-3.5 text-indigo-600 rounded bg-zinc-900 border-zinc-600 focus:ring-0">
+          <span class="text-zinc-300">自动刷新</span>
+        </label>
+        <select id="refresh-interval" class="bg-transparent text-zinc-400 focus:outline-none cursor-pointer text-xs">
+          <option value="2000">2s</option>
+          <option value="5000" selected>5s</option>
+          <option value="10000">10s</option>
+        </select>
+      </div>
+
+      <!-- Manual Refresh Button -->
+      <button id="btn-refresh" class="p-1.5 text-zinc-400 hover:text-white bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg transition" title="手动刷新">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        </svg>
+      </button>
+
+      <!-- Export JSON Button -->
+      <div class="relative inline-block text-left" id="export-dropdown-wrapper">
+        <button id="btn-export-menu" class="flex items-center space-x-1 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold shadow transition">
+          <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+          </svg>
+          <span>导出 JSON</span>
+        </button>
+        <div id="export-menu" class="hidden absolute right-0 mt-2 w-48 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl z-50 py-1 text-xs text-zinc-200">
+          <button id="btn-export-current" class="w-full text-left px-4 py-2 hover:bg-zinc-700 flex items-center space-x-2">
+            <span>📄 导出当前 Session JSON</span>
+          </button>
+          <button id="btn-export-all" class="w-full text-left px-4 py-2 hover:bg-zinc-700 flex items-center space-x-2">
+            <span>📦 导出当前数据库完整 JSON</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Offline File Import -->
+      <label class="cursor-pointer px-2.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white border border-zinc-700 rounded-lg text-xs font-medium transition flex items-center space-x-1.5" title="导入已有的 JSON 遥测文件离线浏览">
+        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+        </svg>
+        <span>离线导入</span>
+        <input type="file" id="file-import" accept=".json" class="hidden" />
+      </label>
+    </div>
+  </header>
+
+  <!-- Global Metrics Strip -->
+  <div class="bg-zinc-900 border-b border-zinc-800 px-6 py-2.5 grid grid-cols-2 md:grid-cols-5 gap-4 text-xs">
+    <div class="flex items-center space-x-3">
+      <div class="p-2 rounded-lg bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+        </svg>
+      </div>
+      <div>
+        <div class="text-zinc-400 font-medium">总会话 (Sessions)</div>
+        <div class="text-sm font-bold text-white flex items-center space-x-1.5">
+          <span id="kpi-threads">0</span>
+          <span id="kpi-threads-sub" class="text-[10px] text-zinc-500 font-normal">(0 主 / 0 子)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center space-x-3">
+      <div class="p-2 rounded-lg bg-amber-500/10 text-amber-400 border border-amber-500/20">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+        </svg>
+      </div>
+      <div>
+        <div class="text-zinc-400 font-medium">总 Token 消耗</div>
+        <div class="text-sm font-bold text-amber-300" id="kpi-tokens">0</div>
+      </div>
+    </div>
+
+    <div class="flex items-center space-x-3">
+      <div class="p-2 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+      </div>
+      <div>
+        <div class="text-zinc-400 font-medium">累计执行耗时</div>
+        <div class="text-sm font-bold text-emerald-300" id="kpi-duration">0s</div>
+      </div>
+    </div>
+
+    <div class="flex items-center space-x-3">
+      <div class="p-2 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16m-7 6h7" />
+        </svg>
+      </div>
+      <div>
+        <div class="text-zinc-400 font-medium">总轮次 / 步骤</div>
+        <div class="text-sm font-bold text-cyan-300">
+          <span id="kpi-turns">0</span> <span class="text-zinc-500 font-normal">turns</span> /
+          <span id="kpi-steps">0</span> <span class="text-zinc-500 font-normal">steps</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center space-x-3">
+      <div class="p-2 rounded-lg bg-fuchsia-500/10 text-fuchsia-400 border border-fuchsia-500/20">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+        </svg>
+      </div>
+      <div>
+        <div class="text-zinc-400 font-medium">工具 / 子Agent / Skill 调用</div>
+        <div class="text-sm font-bold text-fuchsia-300">
+          <span id="kpi-tools">0</span> <span class="text-zinc-500 font-normal">tools</span> /
+          <span id="kpi-subagents" class="text-pink-400 font-semibold">0 sub</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main Container: 2 Columns (Left: Thread Tree, Right: Detailed Workspace) -->
+  <main class="flex-1 flex overflow-hidden">
+
+    <!-- Left Sidebar: Session Hierarchy & Search (380px) -->
+    <aside class="w-96 border-r border-zinc-800 bg-zinc-950 flex flex-col flex-shrink-0">
+      <!-- Search & Filters -->
+      <div class="p-3 border-b border-zinc-800/80 space-y-2">
+        <div class="relative">
+          <svg class="w-4 h-4 text-zinc-500 absolute left-2.5 top-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+          <input type="text" id="search-thread" placeholder="搜索 Prompt 或 Session ID..." class="w-full bg-zinc-900 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-indigo-500">
+        </div>
+        <!-- Status Filter Pills -->
+        <div class="flex items-center space-x-1 text-[11px]" id="status-filters">
+          <button data-status="ALL" class="filter-pill px-2 py-0.5 rounded bg-indigo-600 text-white font-medium">全部</button>
+          <button data-status="COMPLETED" class="filter-pill px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 hover:text-white">成功</button>
+          <button data-status="RUNNING" class="filter-pill px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 hover:text-white">运行中</button>
+          <button data-status="FAILED" class="filter-pill px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 hover:text-white">失败</button>
+        </div>
+      </div>
+
+      <!-- Session Tree List -->
+      <div id="thread-tree-list" class="flex-1 overflow-y-auto p-2 space-y-1.5">
+        <div class="text-center py-12 text-zinc-500 text-xs">正在加载会话列表...</div>
+      </div>
+    </aside>
+
+    <!-- Right Workspace: Selected Session Detail & Multi-tab Analysis -->
+    <section class="flex-1 flex flex-col bg-zinc-900/40 overflow-y-auto" id="workspace-panel">
+      <!-- Empty State View -->
+      <div id="empty-state" class="flex-1 flex flex-col items-center justify-center text-center p-8">
+        <div class="w-16 h-16 rounded-2xl bg-zinc-800/80 border border-zinc-700/60 flex items-center justify-center text-zinc-500 mb-4 shadow-inner">
+          <svg class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+          </svg>
+        </div>
+        <h3 class="text-sm font-semibold text-zinc-300 mb-1">请在左侧选择一个会话 (Session)</h3>
+        <p class="text-xs text-zinc-500 max-w-sm">点击左侧列表中的主会话或 Subagent 子会话，查看详细的 Token 消耗、Turn 瀑布流、Step 工具参数与执行耗时分析。</p>
+      </div>
+
+      <!-- Loaded Session Detail View -->
+      <div id="detail-view" class="hidden flex-1 flex flex-col">
+        <!-- Session Header Banner -->
+        <div class="border-b border-zinc-800 bg-zinc-900/90 p-5">
+          <div class="flex items-start justify-between">
+            <div class="space-y-1.5 flex-1 pr-4">
+              <div class="flex items-center space-x-2 flex-wrap gap-y-1">
+                <span id="detail-role-badge" class="px-2 py-0.5 rounded text-[11px] font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">Main Agent</span>
+                <span id="detail-status-badge" class="px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">COMPLETED</span>
+                <span class="text-xs font-mono text-zinc-400" id="detail-thread-id">session_xxx</span>
+                <span id="detail-parent-link" class="hidden text-xs text-amber-400 hover:underline cursor-pointer"></span>
+              </div>
+              <p class="text-sm font-medium text-zinc-100 leading-relaxed break-words" id="detail-prompt">任务 Prompt 详情...</p>
+              <div class="text-[11px] text-zinc-400 flex items-center space-x-4 pt-1">
+                <span>📁 工作区: <code class="font-mono text-zinc-300" id="detail-workspace">/path</code></span>
+                <span>⏱ 开始于: <span id="detail-created-at">--</span></span>
+              </div>
+            </div>
+
+            <!-- Action Buttons -->
+            <div class="flex items-center space-x-2">
+              <button id="btn-resume-session" class="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 border border-emerald-500 rounded text-xs text-white font-medium transition flex items-center space-x-1 shadow" title="恢复此会话继续交互或从断点续跑">
+                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span>▶️ 恢复/继续对话</span>
+              </button>
+              <button id="btn-mark-suspended" class="hidden px-2.5 py-1 bg-amber-600/80 hover:bg-amber-500 border border-amber-500 rounded text-xs text-white transition flex items-center space-x-1" title="将由于终端退出未打标的历史运行中会话归档为已中断">
+                <span>🛑 标记为已中断</span>
+              </button>
+              <button id="btn-copy-thread-id" class="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-xs text-zinc-300 hover:text-white transition flex items-center space-x-1">
+                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                <span>复制 ID</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Thread Telemetry KPI Grid -->
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4 pt-4 border-t border-zinc-800 text-xs">
+            <div class="bg-zinc-800/40 border border-zinc-800 rounded-lg p-2.5">
+              <div class="text-zinc-400 font-medium">总 Token 消耗</div>
+              <div class="text-base font-bold text-amber-300 mt-0.5" id="detail-total-tokens">0</div>
+              <!-- Token Proportion Bar -->
+              <div class="w-full bg-zinc-700 h-1.5 rounded-full overflow-hidden flex mt-2">
+                <div id="bar-prompt-token" class="bg-indigo-500 h-full" style="width: 50%" title="Prompt Tokens"></div>
+                <div id="bar-comp-token" class="bg-emerald-400 h-full" style="width: 50%" title="Completion Tokens"></div>
+              </div>
+              <div class="flex justify-between text-[10px] text-zinc-400 mt-1 font-mono">
+                <span id="detail-prompt-tokens">P: 0</span>
+                <span id="detail-comp-tokens">C: 0</span>
+              </div>
+            </div>
+
+            <div class="bg-zinc-800/40 border border-zinc-800 rounded-lg p-2.5">
+              <div class="text-zinc-400 font-medium">总耗时 (Duration)</div>
+              <div class="text-base font-bold text-emerald-300 mt-0.5" id="detail-duration">0s</div>
+              <div class="text-[10px] text-zinc-500 mt-2" id="detail-latency-sub">精确毫秒: 0ms</div>
+            </div>
+
+            <div class="bg-zinc-800/40 border border-zinc-800 rounded-lg p-2.5">
+              <div class="text-zinc-400 font-medium">轮次与步数 (Turns / Steps)</div>
+              <div class="text-base font-bold text-cyan-300 mt-0.5">
+                <span id="detail-turns-count">0</span> <span class="text-xs font-normal text-zinc-400">turns</span> /
+                <span id="detail-steps-count">0</span> <span class="text-xs font-normal text-zinc-400">steps</span>
+              </div>
+              <div class="text-[10px] text-zinc-500 mt-2" id="detail-avg-step-time">平均单步: 0ms</div>
+            </div>
+
+            <div class="bg-zinc-800/40 border border-zinc-800 rounded-lg p-2.5">
+              <div class="text-zinc-400 font-medium">派发的子 Agent (Subagents)</div>
+              <div class="text-base font-bold text-fuchsia-300 mt-0.5" id="detail-subagents-count">0</div>
+              <div class="text-[10px] text-zinc-400 mt-2" id="detail-subagents-list">无子任务</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- View Tabs Navigation -->
+        <div class="border-b border-zinc-800 bg-zinc-900/60 px-5 flex items-center space-x-6 text-xs font-medium">
+          <button id="tab-btn-timeline" class="tab-btn py-3 border-b-2 border-indigo-500 text-indigo-400 font-semibold flex items-center space-x-1.5">
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span>Turns 瀑布流 & Step 微观明细</span>
+          </button>
+          <button id="tab-btn-analytics" class="tab-btn py-3 border-b-2 border-transparent text-zinc-400 hover:text-zinc-200 flex items-center space-x-1.5">
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+            <span>工具/技能分析 (Tools & Skills)</span>
+          </button>
+          <button id="tab-btn-json" class="tab-btn py-3 border-b-2 border-transparent text-zinc-400 hover:text-zinc-200 flex items-center space-x-1.5">
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+            </svg>
+            <span>原始 JSON 检查器</span>
+          </button>
+        </div>
+
+        <!-- Tab 1: Turns Timeline & Steps Inspector -->
+        <div id="tab-content-timeline" class="p-6 space-y-4">
+          <div class="flex items-center justify-between mb-2">
+            <h3 class="text-xs font-semibold text-zinc-400 uppercase tracking-wider">执行轮次瀑布流 (Turns Waterfall)</h3>
+            <div class="flex items-center space-x-2 text-xs">
+              <button id="btn-expand-all" class="text-indigo-400 hover:text-indigo-300">全部展开 Steps</button>
+              <span class="text-zinc-600">|</span>
+              <button id="btn-collapse-all" class="text-zinc-400 hover:text-zinc-300">全部折叠</button>
+            </div>
+          </div>
+          <!-- Turn Cards List -->
+          <div id="turn-cards-container" class="space-y-3"></div>
+        </div>
+
+        <!-- Tab 2: Tools & Skills Analytics -->
+        <div id="tab-content-analytics" class="hidden p-6 space-y-6">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- Tool Frequency Ranking Table -->
+            <div class="bg-zinc-800/40 border border-zinc-800 rounded-xl p-4">
+              <h4 class="text-xs font-bold text-zinc-300 uppercase tracking-wider mb-3 flex items-center justify-between">
+                <span>工具调用频次与耗时排行 (Tool Usage)</span>
+                <span class="text-[10px] text-zinc-500 font-normal">按调用次数降序</span>
+              </h4>
+              <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                  <thead class="border-b border-zinc-800 text-zinc-400 text-[11px]">
+                    <tr>
+                      <th class="py-2">工具名称</th>
+                      <th class="py-2 text-right">调用次数</th>
+                      <th class="py-2 text-right">总耗时</th>
+                      <th class="py-2 text-right">平均耗时</th>
+                      <th class="py-2 text-right">失败数</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tool-summary-tbody" class="divide-y divide-zinc-800/60 font-mono">
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- Tool Distribution Chart -->
+            <div class="bg-zinc-800/40 border border-zinc-800 rounded-xl p-4 flex flex-col">
+              <h4 class="text-xs font-bold text-zinc-300 uppercase tracking-wider mb-3">工具分布饼图</h4>
+              <div class="flex-1 flex items-center justify-center min-h-[220px]">
+                <canvas id="tool-chart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- Subagent Invocations Detail Table (if any) -->
+          <div id="subagent-table-container" class="bg-zinc-800/40 border border-zinc-800 rounded-xl p-4">
+            <h4 class="text-xs font-bold text-zinc-300 uppercase tracking-wider mb-3">
+              派发的子 Agent 清单 (Spawned Subagents)
+            </h4>
+            <div class="overflow-x-auto">
+              <table class="w-full text-left text-xs">
+                <thead class="border-b border-zinc-800 text-zinc-400 text-[11px]">
+                  <tr>
+                    <th class="py-2">Subagent 角色</th>
+                    <th class="py-2">子任务描述</th>
+                    <th class="py-2 text-right">Token 消耗</th>
+                    <th class="py-2 text-right">耗时</th>
+                    <th class="py-2 text-right">状态</th>
+                    <th class="py-2 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="subagent-tbody" class="divide-y divide-zinc-800/60">
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 3: Raw JSON Inspector -->
+        <div id="tab-content-json" class="hidden p-6 space-y-3">
+          <div class="flex items-center justify-between">
+            <span class="text-xs text-zinc-400 font-mono">完整的 ThreadDetailReport JSON 数据</span>
+            <button id="btn-copy-json" class="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded text-xs border border-zinc-700">
+              复制 JSON
+            </button>
+          </div>
+          <pre id="raw-json-viewer" class="bg-zinc-950 p-4 rounded-xl border border-zinc-800 font-mono text-xs text-indigo-300 overflow-x-auto max-h-[600px]"></pre>
+        </div>
+
+      </div>
+    </section>
+  </main>
+
+  <!-- Resume Session Modal -->
+  <div id="resume-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+    <div class="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl max-w-lg w-full p-5 space-y-4">
+      <div class="flex items-center justify-between border-b border-zinc-800 pb-3">
+        <div class="flex items-center space-x-2">
+          <span class="text-emerald-400 text-lg">▶️</span>
+          <h3 class="text-sm font-bold text-white">恢复 / 继续历史会话 (Resume Session)</h3>
+        </div>
+        <button id="btn-close-resume-modal" class="text-zinc-400 hover:text-white text-lg leading-none">&times;</button>
+      </div>
+
+      <div>
+        <div class="text-xs text-zinc-400 mb-1">目标 Session ID:</div>
+        <div class="font-mono text-xs text-emerald-300 bg-zinc-950 p-2 rounded border border-zinc-800 break-all select-all" id="resume-modal-session-id">session_xxx</div>
+      </div>
+
+      <!-- Resume Mode Selection -->
+      <div class="space-y-2 text-xs">
+        <div class="text-zinc-400 font-medium">选择恢复模式:</div>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="flex items-start space-x-2 p-2.5 rounded-lg border border-zinc-700 bg-zinc-800/60 cursor-pointer hover:border-emerald-500/50 transition">
+            <input type="radio" name="resume-mode" value="continue" checked class="mt-0.5 text-emerald-500 focus:ring-0">
+            <div>
+              <div class="font-semibold text-zinc-200">💬 追加指令续聊</div>
+              <div class="text-[10px] text-zinc-400 mt-0.5">发送新 Prompt 延续已有上下文与黑板</div>
+            </div>
+          </label>
+          <label class="flex items-start space-x-2 p-2.5 rounded-lg border border-zinc-700 bg-zinc-800/60 cursor-pointer hover:border-emerald-500/50 transition">
+            <input type="radio" name="resume-mode" value="checkpoint" class="mt-0.5 text-emerald-500 focus:ring-0">
+            <div>
+              <div class="font-semibold text-zinc-200">⚡ 断点恢复 (Checkpoint)</div>
+              <div class="text-[10px] text-zinc-400 mt-0.5">重置并续跑未完成的 Milestone</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <!-- Prompt Input -->
+      <div id="resume-prompt-container">
+        <label class="block text-xs text-zinc-400 mb-1 font-medium">后续指令 / 补充说明:</label>
+        <textarea id="resume-prompt-input" rows="3" class="w-full bg-zinc-950 border border-zinc-700 rounded-lg p-2.5 text-xs text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500" placeholder="例如：请继续根据刚才分析的结果编写测试用例并验证..."></textarea>
+      </div>
+
+      <!-- CLI Command Preview -->
+      <div class="bg-zinc-950/70 border border-zinc-800 rounded-lg p-2.5 text-xs">
+        <div class="flex items-center justify-between text-[11px] text-zinc-400 mb-1">
+          <span>终端命令行快捷恢复:</span>
+          <button id="btn-copy-cli-resume" class="text-indigo-400 hover:text-indigo-300 font-medium cursor-pointer">复制命令</button>
+        </div>
+        <code id="resume-cli-cmd" class="text-zinc-300 font-mono text-[11px] block overflow-x-auto py-0.5">npm run tui -- --resume session_xxx</code>
+      </div>
+
+      <!-- Modal Footer -->
+      <div class="flex items-center justify-end space-x-2 pt-2 border-t border-zinc-800">
+        <button id="btn-cancel-resume" class="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-xs transition">取消</button>
+        <button id="btn-submit-resume" class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg text-xs transition flex items-center space-x-1.5">
+          <span id="resume-spinner" class="hidden animate-spin inline-block w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full"></span>
+          <span id="resume-submit-text">🚀 执行恢复</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- JavaScript Application Logic -->
+  <script>
+    let currentDb = '';
+    let currentThreadId = null;
+    let autoRefreshTimer = null;
+    let cachedThreadDetail = null;
+    let toolChartInstance = null;
+    let currentFilterStatus = 'ALL';
+    let searchQuery = '';
+
+    // ================= 1. Initial Loading & DB Selection =================
+    async function initDashboard() {
+      setupEventListeners();
+      await loadDatabases();
+    }
+
+    async function loadDatabases() {
+      try {
+        const res = await fetch('/api/dashboard/databases');
+        if (!res.ok) throw new Error('Failed to load databases list');
+        const dbs = await res.json();
+        const select = document.getElementById('db-select');
+        select.innerHTML = '';
+
+        if (!dbs || dbs.length === 0) {
+          select.innerHTML = '<option value="">无可用数据库</option>';
+          return;
+        }
+
+        dbs.forEach(d => {
+          const opt = document.createElement('option');
+          opt.value = d.name;
+          opt.textContent = `${d.name} (${d.sizeFormatted})${d.isDefault ? ' [默认]' : ''}`;
+          if (d.isDefault || (!currentDb && d.name === 'data.db')) {
+            opt.selected = true;
+            currentDb = d.name;
+          }
+          select.appendChild(opt);
+        });
+
+        if (!currentDb && dbs.length > 0) {
+          currentDb = dbs[0].name;
+        }
+
+        await refreshDashboard();
+      } catch (err) {
+        console.error('Error loading databases:', err);
+      }
+    }
+
+    async function refreshDashboard() {
+      if (!currentDb) return;
+      await Promise.all([
+        loadSummary(),
+        loadThreadTree(),
+        currentThreadId ? loadThreadDetail(currentThreadId, false) : Promise.resolve(),
+      ]);
+    }
+
+    // ================= 2. Summary & KPI Metrics =================
+    async function loadSummary() {
+      try {
+        const res = await fetch(`/api/dashboard/summary?db=${encodeURIComponent(currentDb)}`);
+        if (!res.ok) return;
+        const s = await res.json();
+
+        document.getElementById('kpi-threads').textContent = s.totalThreads;
+        document.getElementById('kpi-threads-sub').textContent = `(${s.mainThreads} 主 / ${s.subagentThreads} 子)`;
+        document.getElementById('kpi-tokens').textContent = formatNumber(s.totalTokens.total);
+        document.getElementById('kpi-duration').textContent = formatDuration(s.totalDurationMs);
+        document.getElementById('kpi-turns').textContent = s.totalTurns;
+        document.getElementById('kpi-steps').textContent = s.totalSteps;
+        document.getElementById('kpi-tools').textContent = s.totalToolCalls;
+        document.getElementById('kpi-subagents').textContent = `${s.totalSubagentCalls} sub`;
+      } catch (err) {
+        console.error('Error loading summary:', err);
+      }
+    }
+
+    // ================= 3. Session Hierarchy Tree =================
+    async function loadThreadTree() {
+      try {
+        const res = await fetch(`/api/dashboard/sessions?db=${encodeURIComponent(currentDb)}`);
+        if (!res.ok) return;
+        const roots = await res.json();
+        renderThreadTree(roots);
+      } catch (err) {
+        console.error('Error loading session list:', err);
+      }
+    }
+
+    function renderThreadTree(roots) {
+      const container = document.getElementById('thread-tree-list');
+      container.innerHTML = '';
+
+      // Filter
+      const filtered = filterThreads(roots);
+
+      if (filtered.length === 0) {
+        container.innerHTML = '<div class="text-center py-12 text-zinc-500 text-xs">未找到符合条件的会话</div>';
+        return;
+      }
+
+      filtered.forEach(root => {
+        container.appendChild(createThreadElement(root, false));
+      });
+    }
+
+    function filterThreads(roots) {
+      const q = searchQuery.toLowerCase().trim();
+      const status = currentFilterStatus;
+
+      function match(item) {
+        const matchesStatus = (status === 'ALL' || item.currentState === status);
+        const matchesQuery = (!q || item.threadId.toLowerCase().includes(q) || (item.prompt && item.prompt.toLowerCase().includes(q)));
+        return matchesStatus && matchesQuery;
+      }
+
+      return roots.filter(root => {
+        const selfMatch = match(root);
+        const childMatch = root.children && root.children.some(c => match(c));
+        return selfMatch || childMatch;
+      });
+    }
+
+    function createThreadElement(item, isChild = false) {
+      const el = document.createElement('div');
+      el.className = `thread-card p-3 rounded-lg border cursor-pointer transition ${
+        currentThreadId === item.threadId
+          ? 'bg-indigo-950/50 border-indigo-500/70 shadow-indigo-900/20 shadow-md'
+          : 'bg-zinc-900/60 hover:bg-zinc-850 border-zinc-800/80 hover:border-zinc-700'
+      } ${isChild ? 'ml-5 relative mt-1.5' : 'mt-2'}`;
+
+      if (isChild) {
+        // Connector line styling
+        const line = document.createElement('div');
+        line.className = 'absolute -left-3.5 top-3 w-3 border-t-2 border-dashed border-zinc-700';
+        el.appendChild(line);
+      }
+
+      // Status Badge Color
+      let statusColor = 'bg-zinc-700 text-zinc-300';
+      if (item.currentState === 'COMPLETED' || item.currentState === 'SUCCESS') statusColor = 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30';
+      else if (item.currentState === 'RUNNING') statusColor = 'bg-blue-500/20 text-blue-300 border-blue-500/30 animate-pulse';
+      else if (item.currentState === 'FAILED') statusColor = 'bg-red-500/20 text-red-300 border-red-500/30';
+
+      // Role tag
+      let roleTag = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-zinc-800 text-zinc-300 border border-zinc-700">${item.role}</span>`;
+      if (item.role === 'explore') roleTag = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-teal-500/20 text-teal-300 border border-teal-500/30">explore</span>`;
+      else if (item.role === 'coder') roleTag = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">coder</span>`;
+      else if (item.role === 'qa') roleTag = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30">qa</span>`;
+
+      el.innerHTML += `
+        <div class="flex items-center justify-between text-[11px] mb-1">
+          <div class="flex items-center space-x-1.5">
+            ${roleTag}
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold border ${statusColor}">${item.currentState}</span>
+          </div>
+          <span class="text-zinc-500 text-[10px]">${formatTimeAgo(item.createdAt)}</span>
+        </div>
+        <div class="text-xs font-medium text-zinc-200 line-clamp-2 leading-tight mb-2">
+          ${escapeHtml(item.prompt || '无 Prompt 说明')}
+        </div>
+        <div class="flex items-center justify-between text-[10px] text-zinc-400 font-mono">
+          <span class="text-amber-400/90 font-semibold">⚡ ${formatNumber(item.tokens.total)} tk</span>
+          <span>⏱ ${formatDuration(item.durationMs)}</span>
+          <span>🔄 ${item.totalTurns}t / 🐾 ${item.totalSteps}s</span>
+        </div>
+      `;
+
+      el.onclick = (e) => {
+        e.stopPropagation();
+        selectThread(item.threadId);
+      };
+
+      // Wrap if it has children
+      if (item.children && item.children.length > 0) {
+        const group = document.createElement('div');
+        group.className = 'thread-group';
+        group.appendChild(el);
+
+        const childrenContainer = document.createElement('div');
+        childrenContainer.className = 'tree-line ml-3.5 pl-1.5 border-l-2 border-zinc-800';
+
+        item.children.forEach(child => {
+          childrenContainer.appendChild(createThreadElement(child, true));
+        });
+
+        group.appendChild(childrenContainer);
+        return group;
+      }
+
+      return el;
+    }
+
+    // ================= 4. Session Detail & Waterfall =================
+    async function selectThread(threadId) {
+      currentThreadId = threadId;
+      // Re-highlight tree item
+      document.querySelectorAll('.thread-card').forEach(c => {
+        c.classList.remove('bg-indigo-950/50', 'border-indigo-500/70');
+      });
+
+      await loadThreadDetail(threadId, true);
+    }
+
+    async function loadThreadDetail(threadId, showLoading = false) {
+      try {
+        const res = await fetch(`/api/dashboard/session/${encodeURIComponent(threadId)}?db=${encodeURIComponent(currentDb)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        cachedThreadDetail = data;
+
+        renderThreadDetail(data);
+      } catch (err) {
+        console.error('Error loading session detail:', err);
+      }
+    }
+
+    function renderThreadDetail(data) {
+      const emptyState = document.getElementById('empty-state');
+      const detailView = document.getElementById('detail-view');
+      emptyState.classList.add('hidden');
+      detailView.classList.remove('hidden');
+
+      const t = data.thread;
+      document.getElementById('detail-thread-id').textContent = t.threadId;
+      document.getElementById('detail-prompt').textContent = t.prompt;
+      document.getElementById('detail-workspace').textContent = t.workspacePath;
+      document.getElementById('detail-created-at').textContent = new Date(t.createdAt).toLocaleString();
+
+      // Role badge
+      const roleBadge = document.getElementById('detail-role-badge');
+      roleBadge.textContent = t.role === 'main' ? 'Main Agent' : `Subagent: ${t.role}`;
+
+      // Status badge
+      const statusBadge = document.getElementById('detail-status-badge');
+      statusBadge.textContent = t.currentState;
+
+      // Mark suspended button for zombie running sessions
+      const btnMark = document.getElementById('btn-mark-suspended');
+      if (t.currentState === 'RUNNING') {
+        btnMark.classList.remove('hidden');
+        btnMark.onclick = async () => {
+          if (confirm(`确认将会话 ${t.threadId} 标记为 SUSPENDED (已中断) 吗？`)) {
+            const res = await fetch('/api/dashboard/session/set-status', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sessionId: t.threadId, status: 'SUSPENDED', db: currentDb }),
+            });
+            if (res.ok) {
+              await refreshDashboard();
+            }
+          }
+        };
+      } else {
+        btnMark.classList.add('hidden');
+      }
+
+      // Parent Link
+      const parentLink = document.getElementById('detail-parent-link');
+      if (data.parentThread) {
+        parentLink.classList.remove('hidden');
+        parentLink.textContent = `↖ 所属主任务: ${data.parentThread.threadId.substring(0, 18)}...`;
+        parentLink.onclick = () => selectThread(data.parentThread.threadId);
+      } else {
+        parentLink.classList.add('hidden');
+      }
+
+      // KPIs
+      document.getElementById('detail-total-tokens').textContent = formatNumber(t.tokens.total);
+      document.getElementById('detail-prompt-tokens').textContent = `Prompt: ${formatNumber(t.tokens.prompt)}`;
+      document.getElementById('detail-comp-tokens').textContent = `Comp: ${formatNumber(t.tokens.completion)}`;
+
+      const pPct = t.tokens.total > 0 ? (t.tokens.prompt / t.tokens.total) * 100 : 50;
+      const cPct = 100 - pPct;
+      document.getElementById('bar-prompt-token').style.width = `${pPct}%`;
+      document.getElementById('bar-comp-token').style.width = `${cPct}%`;
+
+      document.getElementById('detail-duration').textContent = formatDuration(t.durationMs);
+      document.getElementById('detail-latency-sub').textContent = `精确耗时: ${t.durationMs.toLocaleString()} ms`;
+
+      document.getElementById('detail-turns-count').textContent = t.totalTurns;
+      document.getElementById('detail-steps-count').textContent = t.totalSteps;
+      const avgStep = t.totalSteps > 0 ? Math.round(t.durationMs / t.totalSteps) : 0;
+      document.getElementById('detail-avg-step-time').textContent = `平均单步耗时: ${avgStep} ms`;
+
+      const subCount = data.subagentsSummary ? data.subagentsSummary.length : 0;
+      document.getElementById('detail-subagents-count').textContent = subCount;
+      if (subCount > 0) {
+        document.getElementById('detail-subagents-list').textContent = data.subagentsSummary.map(s => s.role).join(', ');
+      } else {
+        document.getElementById('detail-subagents-list').textContent = '无子任务';
+      }
+
+      // Render Waterfall Turns & Steps
+      renderTurnsWaterfall(data.turns);
+
+      // Render Analytics Tab
+      renderAnalyticsTab(data);
+
+      // Render Raw JSON Tab
+      document.getElementById('raw-json-viewer').textContent = JSON.stringify(data, null, 2);
+    }
+
+    function renderTurnsWaterfall(turns) {
+      const container = document.getElementById('turn-cards-container');
+      container.innerHTML = '';
+
+      if (!turns || turns.length === 0) {
+        container.innerHTML = '<div class="text-zinc-500 text-xs py-4">该线程暂无 Turn 记录</div>';
+        return;
+      }
+
+      turns.forEach((turn, idx) => {
+        const turnCard = document.createElement('div');
+        turnCard.className = 'border border-zinc-800 bg-zinc-900/80 rounded-xl overflow-hidden shadow-sm';
+
+        // Tools summary chips
+        const toolsChips = Object.entries(turn.metrics.toolsUsed).map(([tool, count]) => {
+          let color = 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20';
+          if (tool === 'invoke_subagent') color = 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/30';
+          else if (tool === 'skill') color = 'bg-amber-500/20 text-amber-300 border-amber-500/30';
+          return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono border ${color}">${tool}: ${count}</span>`;
+        }).join(' ');
+
+        turnCard.innerHTML = `
+          <!-- Turn Header -->
+          <div class="turn-header p-3.5 bg-zinc-850 hover:bg-zinc-800/80 flex items-center justify-between cursor-pointer transition select-none">
+            <div class="flex items-center space-x-3 flex-wrap gap-y-1">
+              <span class="font-bold text-xs text-white">Turn #${turn.turnIndex}</span>
+              <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-900/40 text-indigo-300 border border-indigo-700/50">${turn.turnType}</span>
+              <span class="text-xs text-zinc-300 font-medium">${escapeHtml(turn.summary || 'Turn 执行轮次')}</span>
+            </div>
+            <div class="flex items-center space-x-3 text-xs text-zinc-400 font-mono">
+              <span class="text-amber-300 font-semibold">${formatNumber(turn.tokens.total)} tk</span>
+              <span>⏱ ${formatDuration(turn.durationMs)}</span>
+              <span>🐾 ${turn.stepCount} steps</span>
+              <svg class="w-4 h-4 text-zinc-400 transform transition-transform turn-chevron" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+              </svg>
+            </div>
+          </div>
+
+          <!-- Tools Used Summary Strip in Turn -->
+          <div class="px-3.5 py-1.5 bg-zinc-900 border-t border-zinc-800/80 flex items-center space-x-2 flex-wrap gap-y-1 text-[11px]">
+            <span class="text-zinc-500 text-[10px]">调用统计:</span>
+            ${toolsChips || '<span class="text-zinc-500 text-[10px]">纯思考 (无工具调用)</span>'}
+            <span class="ml-auto text-[10px] text-zinc-500">模型调用: ${turn.metrics.modelCallsCount} 次</span>
+          </div>
+
+          <!-- Turn Steps Drawer (Default Expanded) -->
+          <div class="turn-steps-body p-3 bg-zinc-950/90 border-t border-zinc-800 space-y-2">
+            ${renderStepItems(turn.steps)}
+          </div>
+        `;
+
+        // Toggle turn accordion
+        const header = turnCard.querySelector('.turn-header');
+        const body = turnCard.querySelector('.turn-steps-body');
+        const chevron = turnCard.querySelector('.turn-chevron');
+
+        header.onclick = () => {
+          body.classList.toggle('hidden');
+          chevron.classList.toggle('rotate-180');
+        };
+
+        container.appendChild(turnCard);
+      });
+    }
+
+    function renderStepItems(steps) {
+      if (!steps || steps.length === 0) {
+        return '<div class="text-zinc-500 text-[11px] py-1">无 Step 步骤明细</div>';
+      }
+
+      return steps.map((step) => {
+        let typeBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/10 text-purple-300 border border-purple-500/20">MODEL</span>`;
+        let toolBadge = '';
+
+        if (step.stepType === 'TOOL_EXECUTION') {
+          typeBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">TOOL</span>`;
+          if (step.isSubagent) {
+            toolBadge = `<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-fuchsia-600 text-white shadow-sm flex items-center space-x-1">
+              <span>🤖 invoke_subagent</span>
+              <span class="text-[9px] bg-fuchsia-800 px-1 rounded">${step.subagentRole || 'explore'}</span>
+            </span>`;
+          } else if (step.isSkill) {
+            toolBadge = `<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-amber-600 text-white shadow-sm">
+              ⚡ skill: ${step.skillName || ''}
+            </span>`;
+          } else {
+            toolBadge = `<span class="px-1.5 py-0.5 rounded text-[11px] font-mono font-semibold bg-zinc-800 text-zinc-200 border border-zinc-700">
+              🔧 ${step.toolName}
+            </span>`;
+          }
+        }
+
+        // Status
+        let statusBadge = `<span class="text-[10px] font-mono text-emerald-400">OK</span>`;
+        if (step.status === 'FAILED') statusBadge = `<span class="text-[10px] font-mono text-red-400">FAIL</span>`;
+
+        // Metadata JSON format
+        const hasMeta = step.metadata && Object.keys(step.metadata).length > 0;
+        const metaStr = hasMeta ? JSON.stringify(step.metadata, null, 2) : '';
+
+        return `
+          <div class="step-item border border-zinc-800/80 bg-zinc-900/60 rounded-lg p-2.5 text-xs">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center space-x-2 flex-wrap gap-y-1">
+                <span class="font-mono text-zinc-500 text-[10px]">#${step.stepIndex}</span>
+                ${typeBadge}
+                ${toolBadge}
+                ${statusBadge}
+              </div>
+              <div class="flex items-center space-x-3 text-[11px] font-mono text-zinc-400">
+                <span class="text-amber-400">${formatNumber(step.tokens.total)} tk</span>
+                <span>⏱ ${step.durationMs}ms</span>
+              </div>
+            </div>
+
+            <!-- Error message banner if any -->
+            ${step.errorMessage ? `
+              <div class="mt-2 p-2 rounded bg-red-950/50 border border-red-800/60 text-red-300 text-[11px] font-mono">
+                ❌ 错误: ${escapeHtml(step.errorMessage)}
+              </div>
+            ` : ''}
+
+            <!-- Expandable JSON Metadata -->
+            ${hasMeta ? `
+              <details class="mt-2 pt-2 border-t border-zinc-800/50">
+                <summary class="text-[10px] text-zinc-500 hover:text-zinc-300 cursor-pointer select-none font-mono">
+                  查看入参与执行元数据 (Metadata)
+                </summary>
+                <pre class="mt-1.5 p-2 bg-zinc-950 rounded border border-zinc-800 font-mono text-[11px] text-zinc-300 overflow-x-auto code-scroll">${escapeHtml(metaStr)}</pre>
+              </details>
+            ` : ''}
+          </div>
+        `;
+      }).join('');
+    }
+
+    // ================= 5. Analytics Tab & Charts =================
+    function renderAnalyticsTab(data) {
+      // 1. Tool Summary Table
+      const tbody = document.getElementById('tool-summary-tbody');
+      tbody.innerHTML = '';
+
+      if (!data.toolSummary || data.toolSummary.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-zinc-500">无工具执行数据</td></tr>';
+      } else {
+        data.toolSummary.forEach(item => {
+          const tr = document.createElement('tr');
+          tr.className = 'hover:bg-zinc-800/40 transition';
+          tr.innerHTML = `
+            <td class="py-2 text-zinc-200 font-semibold">${item.toolName}</td>
+            <td class="py-2 text-right text-indigo-300">${item.callCount}</td>
+            <td class="py-2 text-right text-zinc-400">${formatDuration(item.totalDurationMs)}</td>
+            <td class="py-2 text-right text-zinc-400">${item.avgDurationMs}ms</td>
+            <td class="py-2 text-right ${item.failedCount > 0 ? 'text-red-400 font-bold' : 'text-zinc-500'}">${item.failedCount}</td>
+          `;
+          tbody.appendChild(tr);
+        });
+      }
+
+      // 2. Chart.js Tool Distribution
+      const ctx = document.getElementById('tool-chart');
+      if (toolChartInstance) {
+        toolChartInstance.destroy();
+      }
+
+      if (data.toolSummary && data.toolSummary.length > 0) {
+        const labels = data.toolSummary.map(t => t.toolName);
+        const counts = data.toolSummary.map(t => t.callCount);
+
+        toolChartInstance = new Chart(ctx, {
+          type: 'doughnut',
+          data: {
+            labels,
+            datasets: [{
+              data: counts,
+              backgroundColor: [
+                '#6366f1', '#06b6d4', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#3b82f6'
+              ],
+              borderWidth: 0,
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                position: 'right',
+                labels: { color: '#a1a1aa', boxWidth: 12, font: { size: 11 } }
+              }
+            }
+          }
+        });
+      }
+
+      // 3. Subagents Table
+      const subContainer = document.getElementById('subagent-table-container');
+      const subTbody = document.getElementById('subagent-tbody');
+      subTbody.innerHTML = '';
+
+      if (!data.subagentsSummary || data.subagentsSummary.length === 0) {
+        subContainer.classList.add('hidden');
+      } else {
+        subContainer.classList.remove('hidden');
+        data.subagentsSummary.forEach(s => {
+          const tr = document.createElement('tr');
+          tr.className = 'hover:bg-zinc-800/40 transition';
+          tr.innerHTML = `
+            <td class="py-2 font-semibold text-teal-300 font-mono">[${s.role}]</td>
+            <td class="py-2 text-zinc-300 max-w-xs truncate" title="${escapeHtml(s.prompt)}">${escapeHtml(s.prompt)}</td>
+            <td class="py-2 text-right text-amber-300 font-mono">${formatNumber(s.totalTokens)}</td>
+            <td class="py-2 text-right text-zinc-400 font-mono">${formatDuration(s.durationMs)}</td>
+            <td class="py-2 text-right text-emerald-400 font-mono">${s.status}</td>
+            <td class="py-2 text-right">
+              <button class="text-indigo-400 hover:text-indigo-300 underline" onclick="selectThread('${s.threadId}')">查看明细</button>
+            </td>
+          `;
+          subTbody.appendChild(tr);
+        });
+      }
+    }
+
+    // ================= 6. Event Listeners & UI Controls =================
+    function setupEventListeners() {
+      // Database change
+      document.getElementById('db-select').onchange = (e) => {
+        currentDb = e.target.value;
+        currentThreadId = null;
+        document.getElementById('detail-view').classList.add('hidden');
+        document.getElementById('empty-state').classList.remove('hidden');
+        refreshDashboard();
+      };
+
+      // Manual refresh
+      document.getElementById('btn-refresh').onclick = refreshDashboard;
+
+      // Auto refresh toggle
+      document.getElementById('auto-refresh-toggle').onchange = (e) => {
+        if (e.target.checked) {
+          const interval = parseInt(document.getElementById('refresh-interval').value, 10) || 5000;
+          autoRefreshTimer = setInterval(refreshDashboard, interval);
+        } else {
+          if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+          autoRefreshTimer = null;
+        }
+      };
+
+      document.getElementById('refresh-interval').onchange = () => {
+        const toggle = document.getElementById('auto-refresh-toggle');
+        if (toggle.checked) {
+          if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+          const interval = parseInt(document.getElementById('refresh-interval').value, 10) || 5000;
+          autoRefreshTimer = setInterval(refreshDashboard, interval);
+        }
+      };
+
+      // Search input
+      document.getElementById('search-thread').oninput = (e) => {
+        searchQuery = e.target.value;
+        loadThreadTree();
+      };
+
+      // Status filter pills
+      document.querySelectorAll('.filter-pill').forEach(btn => {
+        btn.onclick = () => {
+          document.querySelectorAll('.filter-pill').forEach(b => {
+            b.classList.remove('bg-indigo-600', 'text-white');
+            b.classList.add('bg-zinc-800', 'text-zinc-400');
+          });
+          btn.classList.remove('bg-zinc-800', 'text-zinc-400');
+          btn.classList.add('bg-indigo-600', 'text-white');
+          currentFilterStatus = btn.dataset.status;
+          loadThreadTree();
+        };
+      });
+
+      // Tabs switching
+      const tabBtns = {
+        timeline: document.getElementById('tab-btn-timeline'),
+        analytics: document.getElementById('tab-btn-analytics'),
+        json: document.getElementById('tab-btn-json'),
+      };
+      const tabContents = {
+        timeline: document.getElementById('tab-content-timeline'),
+        analytics: document.getElementById('tab-content-analytics'),
+        json: document.getElementById('tab-content-json'),
+      };
+
+      function switchTab(name) {
+        Object.entries(tabBtns).forEach(([k, btn]) => {
+          if (k === name) {
+            btn.classList.add('border-indigo-500', 'text-indigo-400');
+            btn.classList.remove('border-transparent', 'text-zinc-400');
+          } else {
+            btn.classList.remove('border-indigo-500', 'text-indigo-400');
+            btn.classList.add('border-transparent', 'text-zinc-400');
+          }
+        });
+        Object.entries(tabContents).forEach(([k, content]) => {
+          if (k === name) content.classList.remove('hidden');
+          else content.classList.add('hidden');
+        });
+      }
+
+      tabBtns.timeline.onclick = () => switchTab('timeline');
+      tabBtns.analytics.onclick = () => switchTab('analytics');
+      tabBtns.json.onclick = () => switchTab('json');
+
+      // Expand / Collapse all
+      document.getElementById('btn-expand-all').onclick = () => {
+        document.querySelectorAll('.turn-steps-body').forEach(b => b.classList.remove('hidden'));
+        document.querySelectorAll('.turn-chevron').forEach(c => c.classList.remove('rotate-180'));
+      };
+      document.getElementById('btn-collapse-all').onclick = () => {
+        document.querySelectorAll('.turn-steps-body').forEach(b => b.classList.add('hidden'));
+        document.querySelectorAll('.turn-chevron').forEach(c => c.classList.add('rotate-180'));
+      };
+
+      // Export Menu
+      const exportMenu = document.getElementById('export-menu');
+      document.getElementById('btn-export-menu').onclick = (e) => {
+        e.stopPropagation();
+        exportMenu.classList.toggle('hidden');
+      };
+      document.body.onclick = () => exportMenu.classList.add('hidden');
+
+      // Export Current Session
+      document.getElementById('btn-export-current').onclick = () => {
+        if (!cachedThreadDetail) {
+          alert('请先选择一个 Session 才能导出');
+          return;
+        }
+        downloadJson(cachedThreadDetail, `session-${cachedThreadDetail.thread.threadId}.json`);
+      };
+
+      // Export All Database
+      document.getElementById('btn-export-all').onclick = () => {
+        window.open(`/api/dashboard/export?db=${encodeURIComponent(currentDb)}`, '_blank');
+      };
+
+      // Copy Session ID
+      document.getElementById('btn-copy-thread-id').onclick = () => {
+        if (currentThreadId) {
+          navigator.clipboard.writeText(currentThreadId);
+          alert('已复制 Session ID 到剪贴板');
+        }
+      };
+
+      // Copy Raw JSON
+      document.getElementById('btn-copy-json').onclick = () => {
+        if (cachedThreadDetail) {
+          navigator.clipboard.writeText(JSON.stringify(cachedThreadDetail, null, 2));
+          alert('已复制完整 JSON 到剪贴板');
+        }
+      };
+
+      // Resume Session Modal Controls
+      const resumeModal = document.getElementById('resume-modal');
+      const btnResumeSession = document.getElementById('btn-resume-session');
+      const btnCloseResumeModal = document.getElementById('btn-close-resume-modal');
+      const btnCancelResume = document.getElementById('btn-cancel-resume');
+      const btnSubmitResume = document.getElementById('btn-submit-resume');
+      const btnCopyCliResume = document.getElementById('btn-copy-cli-resume');
+      const resumeSessionIdEl = document.getElementById('resume-modal-session-id');
+      const resumeCliCmdEl = document.getElementById('resume-cli-cmd');
+      const resumePromptInput = document.getElementById('resume-prompt-input');
+      const resumeSpinner = document.getElementById('resume-spinner');
+      const resumeSubmitText = document.getElementById('resume-submit-text');
+
+      if (btnResumeSession) {
+        btnResumeSession.onclick = () => {
+          if (!currentThreadId) {
+            alert('请先在左侧选择一个会话 (Session)');
+            return;
+          }
+          resumeSessionIdEl.textContent = currentThreadId;
+          const isCheckpoint = document.querySelector('input[name="resume-mode"]:checked')?.value === 'checkpoint';
+          resumeCliCmdEl.textContent = isCheckpoint
+            ? `npm run task -- --resume ${currentThreadId}`
+            : `npm run tui -- --resume ${currentThreadId}`;
+          resumePromptInput.value = '';
+          resumeModal.classList.remove('hidden');
+          resumePromptInput.focus();
+        };
+      }
+
+      const closeResumeModal = () => {
+        resumeModal.classList.add('hidden');
+      };
+      if (btnCloseResumeModal) btnCloseResumeModal.onclick = closeResumeModal;
+      if (btnCancelResume) btnCancelResume.onclick = closeResumeModal;
+
+      // Mode switch
+      document.querySelectorAll('input[name="resume-mode"]').forEach(r => {
+        r.onchange = (e) => {
+          if (e.target.value === 'checkpoint') {
+            resumePromptInput.placeholder = '（可选）针对性断点重试提示词，留空则直接执行重试剩余里程碑...';
+            resumeCliCmdEl.textContent = `npm run task -- --resume ${currentThreadId || 'session_xxx'}`;
+          } else {
+            resumePromptInput.placeholder = '例如：请继续编写剩余的测试用例并验证...';
+            resumeCliCmdEl.textContent = `npm run tui -- --resume ${currentThreadId || 'session_xxx'}`;
+          }
+        };
+      });
+
+      // Copy CLI Command
+      if (btnCopyCliResume) {
+        btnCopyCliResume.onclick = () => {
+          navigator.clipboard.writeText(resumeCliCmdEl.textContent);
+          alert('已复制终端恢复命令到剪贴板！');
+        };
+      }
+
+      // Submit Resume
+      if (btnSubmitResume) {
+        btnSubmitResume.onclick = async () => {
+          if (!currentThreadId) return;
+          const mode = document.querySelector('input[name="resume-mode"]:checked')?.value || 'continue';
+          const prompt = resumePromptInput.value.trim();
+
+          btnSubmitResume.disabled = true;
+          resumeSpinner.classList.remove('hidden');
+          resumeSubmitText.textContent = '正在恢复执行中...';
+
+          try {
+            const res = await fetch('/api/dashboard/session/resume', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                sessionId: currentThreadId,
+                prompt,
+                mode,
+                db: currentDb,
+              }),
+            });
+            const result = await res.json();
+            if (res.ok && result.success) {
+              closeResumeModal();
+              await refreshDashboard();
+              alert(`✅ 会话恢复完成！\n状态: ${result.status || '成功'}\n${result.message || ''}`);
+            } else {
+              alert(`❌ 恢复执行失败: ${result.message || result.error || '未知错误'}`);
+            }
+          } catch (err) {
+            alert(`❌ 网络或服务端错误: ${err.message}`);
+          } finally {
+            btnSubmitResume.disabled = false;
+            resumeSpinner.classList.add('hidden');
+            resumeSubmitText.textContent = '🚀 执行恢复';
+          }
+        };
+      }
+
+      // Offline file import
+      document.getElementById('file-import').onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+          try {
+            const parsed = JSON.parse(evt.target.result);
+            if (parsed.thread && parsed.turns) {
+              // It's a single thread detail report
+              cachedThreadDetail = parsed;
+              renderThreadDetail(parsed);
+              alert('成功加载离线 Thread JSON 数据！');
+            } else if (parsed.threads && Array.isArray(parsed.threads)) {
+              // It's a full export
+              renderThreadTree(parsed.threads);
+              if (parsed.threads.length > 0) {
+                renderThreadDetail(parsed.threads[0]);
+              }
+              alert('成功加载离线完整数据库 JSON！');
+            } else {
+              alert('无法识别的 JSON 结构');
+            }
+          } catch (err) {
+            alert('JSON 解析失败: ' + err.message);
+          }
+        };
+        reader.readAsText(file);
+      };
+    }
+
+    // ================= 7. Helper Formatters =================
+    function formatNumber(num) {
+      if (!num) return '0';
+      if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+      if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+      return num.toLocaleString();
+    }
+
+    function formatDuration(ms) {
+      if (!ms || ms <= 0) return '0s';
+      const sec = Math.floor(ms / 1000);
+      if (sec < 60) return `${(ms / 1000).toFixed(1)}s`;
+      const min = Math.floor(sec / 60);
+      const remainSec = sec % 60;
+      return `${min}m ${remainSec}s`;
+    }
+
+    function formatTimeAgo(timestamp) {
+      if (!timestamp) return '';
+      const diff = Date.now() - timestamp;
+      const sec = Math.floor(diff / 1000);
+      if (sec < 60) return '刚刚';
+      const min = Math.floor(sec / 60);
+      if (min < 60) return `${min}分钟前`;
+      const hour = Math.floor(min / 60);
+      if (hour < 24) return `${hour}小时前`;
+      return new Date(timestamp).toLocaleDateString();
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function downloadJson(data, filename) {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    // Start on DOM ready
+    window.addEventListener('DOMContentLoaded', initDashboard);
+  </script>
+</body>
+</html>

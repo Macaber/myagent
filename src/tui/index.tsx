@@ -9,12 +9,14 @@ import { createMemoryTransportPair } from '../client/memory-transport.js';
 import { HttpAcpClientTransport } from '../client/http-client-transport.js';
 import { createAgentRuntime, resolveDefaultProvider } from '../index.js';
 import { OpenAIProvider } from '../provider/openai-provider.js';
+import { getMyAgentHome, getDefaultDbPath } from '../config/paths.js';
 import { App } from './app.js';
 
 interface TuiCliOptions {
   connectUrl?: string;
   workspacePath: string;
   model?: string;
+  resumeSessionId?: string;
 }
 
 function parseCliArgs(): TuiCliOptions {
@@ -22,6 +24,7 @@ function parseCliArgs(): TuiCliOptions {
   let connectUrl: string | undefined;
   let workspacePath = process.cwd();
   let model: string | undefined;
+  let resumeSessionId: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -37,10 +40,18 @@ function parseCliArgs(): TuiCliOptions {
       model = arg.split('=')[1];
     } else if (arg === '--model' && args[i + 1]) {
       model = args[++i];
+    } else if (arg.startsWith('--resume=')) {
+      resumeSessionId = arg.split('=')[1];
+    } else if (arg === '--resume' && args[i + 1]) {
+      resumeSessionId = args[++i];
+    } else if (arg.startsWith('--session=')) {
+      resumeSessionId = arg.split('=')[1];
+    } else if (arg === '--session' && args[i + 1]) {
+      resumeSessionId = args[++i];
     }
   }
 
-  return { connectUrl, workspacePath, model };
+  return { connectUrl, workspacePath, model, resumeSessionId };
 }
 
 function redirectConsoleToLogFile(logFilePath: string): () => void {
@@ -91,7 +102,7 @@ export async function runTui(): Promise<void> {
     client = new AcpClient(transport);
   } else {
     // 2. Out-of-the-box decoupled in-process ACP communication
-    const logFilePath = path.join(workspaceRoot, '.agent', 'tui.log');
+    const logFilePath = path.join(getMyAgentHome(), 'tui.log');
     restoreConsole = redirectConsoleToLogFile(logFilePath);
 
     const { clientTransport, serverTransport } = createMemoryTransportPair();
@@ -113,7 +124,7 @@ export async function runTui(): Promise<void> {
 
     const runtime = createAgentRuntime({
       workspaceRoot,
-      dbPath: path.join(workspaceRoot, '.agent', 'data.db'),
+      dbPath: getDefaultDbPath(),
       transport: serverTransport,
       provider,
     });
@@ -130,14 +141,37 @@ export async function runTui(): Promise<void> {
     roots: [workspaceRoot],
   });
 
-  // 4. Create Session
-  const sessionResult = await client.newSession({
-    workspacePath: workspaceRoot,
-    roots: [workspaceRoot],
-    systemPrompt: 'You are a helpful AI software engineer assistant.',
-  });
+  // 4. Create or Resume Session
+  let sessionId: string;
+  const initialReplayUpdates: any[] = [];
 
-  const sessionId = sessionResult.sessionId;
+  if (options.resumeSessionId) {
+    sessionId = options.resumeSessionId;
+    const unsub = client.onSessionUpdate((notif: any) => {
+      initialReplayUpdates.push(notif);
+    });
+
+    try {
+      await client.loadSession(sessionId);
+    } catch (err: any) {
+      process.stderr.write(`[TUI Warning] Failed to load session '${sessionId}': ${err.message}. Initializing new session instead.\n`);
+      const sessionResult = await client.newSession({
+        workspacePath: workspaceRoot,
+        roots: [workspaceRoot],
+        systemPrompt: 'You are a helpful AI software engineer assistant.',
+      });
+      sessionId = sessionResult.sessionId;
+    } finally {
+      unsub();
+    }
+  } else {
+    const sessionResult = await client.newSession({
+      workspacePath: workspaceRoot,
+      roots: [workspaceRoot],
+      systemPrompt: 'You are a helpful AI software engineer assistant.',
+    });
+    sessionId = sessionResult.sessionId;
+  }
 
   // 5. Render Ink TUI
   const inkApp = render(
@@ -146,6 +180,7 @@ export async function runTui(): Promise<void> {
       sessionId,
       modelName,
       workspacePath: workspaceRoot,
+      initialUpdates: initialReplayUpdates,
       onExit: async () => {
         if (restoreConsole) restoreConsole();
         if (cleanupRuntime) cleanupRuntime();

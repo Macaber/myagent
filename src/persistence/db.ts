@@ -127,21 +127,27 @@ export class AgentDatabase {
         created_at INTEGER NOT NULL
       );
 
-      -- 7. ACP Sessions
-      CREATE TABLE IF NOT EXISTS acp_sessions (
-        session_id TEXT PRIMARY KEY,
-        cwd TEXT NOT NULL,
-        title TEXT,
-        additional_directories TEXT,
-        current_mode_id TEXT,
-        config_options TEXT,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        deleted INTEGER DEFAULT 0
-      );
-      CREATE INDEX IF NOT EXISTS idx_acp_sessions_cwd ON acp_sessions(cwd);
-    `);
-  }
+        -- 7. ACP Sessions
+        CREATE TABLE IF NOT EXISTS acp_sessions (
+          session_id TEXT PRIMARY KEY,
+          cwd TEXT NOT NULL,
+          title TEXT,
+          additional_directories TEXT,
+          current_mode_id TEXT,
+          config_options TEXT,
+          history TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          deleted INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_acp_sessions_cwd ON acp_sessions(cwd);
+      `);
+
+      // Safe schema migration for existing databases
+      try {
+        this.db.exec(`ALTER TABLE acp_sessions ADD COLUMN history TEXT`);
+      } catch {}
+    }
 
   public saveAcpSession(session: {
     sessionId: string;
@@ -150,19 +156,21 @@ export class AgentDatabase {
     additionalDirectories?: string[];
     currentModeId?: string;
     configOptions?: any[];
+    history?: any[];
     createdAt?: number;
     updatedAt?: number;
     deleted?: boolean;
   }): void {
     const stmt = this.db.prepare(`
-      INSERT INTO acp_sessions (session_id, cwd, title, additional_directories, current_mode_id, config_options, created_at, updated_at, deleted)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO acp_sessions (session_id, cwd, title, additional_directories, current_mode_id, config_options, history, created_at, updated_at, deleted)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(session_id) DO UPDATE SET
         cwd = excluded.cwd,
         title = excluded.title,
         additional_directories = excluded.additional_directories,
         current_mode_id = excluded.current_mode_id,
         config_options = excluded.config_options,
+        history = COALESCE(excluded.history, acp_sessions.history),
         updated_at = excluded.updated_at,
         deleted = excluded.deleted
     `);
@@ -173,6 +181,7 @@ export class AgentDatabase {
       JSON.stringify(session.additionalDirectories || []),
       session.currentModeId ?? 'code',
       JSON.stringify(session.configOptions || []),
+      session.history ? JSON.stringify(session.history) : null,
       session.createdAt || Date.now(),
       session.updatedAt || Date.now(),
       session.deleted ? 1 : 0
@@ -190,10 +199,87 @@ export class AgentDatabase {
       additionalDirectories: row.additional_directories ? JSON.parse(row.additional_directories) : [],
       currentModeId: row.current_mode_id,
       configOptions: row.config_options ? JSON.parse(row.config_options) : [],
+      history: row.history ? JSON.parse(row.history) : [],
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       deleted: Boolean(row.deleted),
     };
+  }
+
+  public synthesizeSessionHistory(sessionId: string): any[] {
+    const existing = this.getAcpSession(sessionId);
+    if (existing && existing.history && existing.history.length > 0) {
+      return existing.history;
+    }
+
+    const rawDb = this.getRawDb();
+    const history: any[] = [];
+
+    // 1. Locate thread or session record
+    const thread = rawDb.prepare(
+      'SELECT thread_id, session_id, prompt, workspace_path FROM threads WHERE thread_id = ? OR session_id = ? LIMIT 1'
+    ).get(sessionId, sessionId) as any;
+
+    if (!thread) return history;
+
+    // 2. Synthesize initial user prompt
+    if (thread.prompt && thread.prompt !== 'Session initialized' && thread.prompt !== 'Session loaded') {
+      history.push({
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: thread.prompt },
+      });
+    }
+
+    // 3. Synthesize from turns & steps
+    const turns = rawDb.prepare(
+      'SELECT turn_id, turn_index, turn_type, status, summary FROM turns WHERE thread_id = ? ORDER BY turn_index ASC'
+    ).all(thread.thread_id) as any[];
+
+    for (const turn of turns) {
+      const steps = rawDb.prepare(
+        'SELECT step_id, step_type, tool_name, status, error_message, metadata FROM steps WHERE turn_id = ? ORDER BY step_index ASC'
+      ).all(turn.turn_id) as any[];
+
+      for (const step of steps) {
+        if (step.step_type === 'TOOL_EXECUTION' && step.tool_name) {
+          let parsedMeta: any = {};
+          try {
+            parsedMeta = step.metadata ? JSON.parse(step.metadata) : {};
+          } catch {}
+
+          history.push({
+            sessionUpdate: 'tool_call',
+            callId: step.step_id,
+            title: step.tool_name,
+            rawInput: parsedMeta.args || {},
+          });
+
+          history.push({
+            sessionUpdate: 'tool_call_update',
+            callId: step.step_id,
+            status: step.status === 'SUCCESS' ? 'completed' : 'failed',
+            output: parsedMeta.resultPreview || step.error_message || 'Success',
+          });
+        }
+      }
+
+      if (turn.summary) {
+        history.push({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: turn.summary },
+        });
+      }
+    }
+
+    // Cache synthesized history back into acp_sessions
+    if (existing) {
+      this.saveAcpSession({
+        ...existing,
+        history,
+      });
+    }
+
+    return history;
   }
 
   public listAcpSessions(cwd?: string, limit: number = 50, cursor?: string): { sessions: any[]; nextCursor?: string } {

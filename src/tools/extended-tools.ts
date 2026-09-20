@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import { AgentTool, ToolExecutionContext } from './tool-registry.js';
 import { TodoItem } from '../context/blackboard.js';
+import { getSkillsDir } from '../config/paths.js';
 
 // =================== 1. todowrite ===================
 export const todoWriteTool: AgentTool<{ todos: TodoItem[] }> = {
@@ -49,13 +50,14 @@ export const skillTool: AgentTool<{ skillName?: string; action?: 'get' | 'list' 
   async execute(params, context) {
     const root = context.workspaceJail.getWorkspaceRoot();
     const action = params.action || (params.skillName === 'list' || !params.skillName ? 'list' : 'get');
+    const globalSkillsDir = getSkillsDir();
 
     if (action === 'list') {
       const skillsDir = `${root}/.agent/skills`;
       const projectSkillsDir = `${root}/skills`;
       const foundSkills: string[] = ['analyst (built-in)', 'developer (built-in)', 'qa (built-in)'];
 
-      for (const dir of [skillsDir, projectSkillsDir]) {
+      for (const dir of [globalSkillsDir, skillsDir, projectSkillsDir]) {
         if (fs.existsSync(dir)) {
           const files = fs.readdirSync(dir, { withFileTypes: true });
           for (const f of files) {
@@ -72,6 +74,8 @@ export const skillTool: AgentTool<{ skillName?: string; action?: 'get' | 'list' 
 
     const name = params.skillName || 'developer';
     const candidatePaths = [
+      `${globalSkillsDir}/${name}/SKILL.md`,
+      `${globalSkillsDir}/${name}.md`,
       `${root}/.agent/skills/${name}/SKILL.md`,
       `${root}/.agent/skills/${name}.md`,
       `${root}/skills/${name}/SKILL.md`,

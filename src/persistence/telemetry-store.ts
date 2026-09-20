@@ -124,8 +124,17 @@ export class TelemetryStore {
         created_at, updated_at, total_duration_ms, total_prompt_tokens,
         total_completion_tokens, total_tokens, total_turns, total_steps
       ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, 0, 0, 0, 0, 0, 0)
+      ON CONFLICT(thread_id) DO UPDATE SET
+        updated_at = excluded.updated_at,
+        current_state = CASE WHEN current_state = 'COMPLETED' THEN 'COMPLETED' ELSE 'PENDING' END
     `);
     stmt.run(params.threadId, params.sessionId, params.parentThreadId ?? null, params.prompt, params.workspacePath, now, now);
+  }
+
+  public getTurnCount(threadId: string): number {
+    const rawDb = this.db.getRawDb();
+    const row = rawDb.prepare('SELECT COUNT(*) as c FROM turns WHERE thread_id = ?').get(threadId) as any;
+    return Number(row?.c || 0);
   }
 
   public updateThreadState(threadId: string, state: string, currentTurnId?: string): void {
@@ -422,4 +431,33 @@ export class TelemetryStore {
       turnsBreakdown,
     };
   }
+
+  // =================== Session Conceptual Aliases ===================
+  public recordSessionStart(params: {
+    sessionId: string;
+    parentSessionId?: string;
+    prompt: string;
+    workspacePath: string;
+  }): void {
+    this.recordThreadStart({
+      threadId: params.sessionId,
+      sessionId: params.sessionId,
+      parentThreadId: params.parentSessionId,
+      prompt: params.prompt,
+      workspacePath: params.workspacePath,
+    });
+  }
+
+  public updateSessionState(sessionId: string, state: string, currentTurnId?: string): void {
+    this.updateThreadState(sessionId, state, currentTurnId);
+  }
+
+  public recordSessionEnd(sessionId: string, status: string, errorMessage?: string): void {
+    this.recordThreadEnd(sessionId, status, errorMessage);
+  }
+
+  public getSessionMetrics(sessionId: string): ThreadMetricsReport {
+    return this.getThreadMetrics(sessionId);
+  }
 }
+

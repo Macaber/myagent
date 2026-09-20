@@ -244,11 +244,10 @@ describe('Dynamic Context & On-Demand Capabilities Engine', () => {
 
     const prompt = context[0].content as string;
 
-    // (A) Verify Goal & Budget Anchor
-    assert.ok(prompt.includes('=== GOAL & BUDGET ANCHOR ==='));
+    // (A) Verify Goal & Milestone Invariant Anchor
+    assert.ok(prompt.includes('=== GOAL & MILESTONE ==='));
     assert.ok(prompt.includes('Global Task Goal: Design resilient gateway'));
     assert.ok(prompt.includes('Current Active Milestone: [Unit Testing]'));
-    assert.ok(prompt.includes('Token Budget: 12500 used / 100000 total (87500 remaining)'));
 
     // (B) Verify Workspace Delta Ledger (Ground Truth)
     assert.ok(prompt.includes('=== WORKSPACE DELTA (Modified Files) ==='));
@@ -345,4 +344,116 @@ describe('Dynamic Context & On-Demand Capabilities Engine', () => {
     assert.ok(result.includes('package.json'));
     assert.ok(result.includes('src'));
   });
+
+  test('8. Observation Masking: Condenses older tool outputs while preserving tool_call_id pairs', () => {
+    const compactor = new MemoryCompactor();
+
+    const messages = [
+      { role: 'user', content: 'Do a complex task' },
+      // Turn 1
+      { role: 'assistant', content: 'Step 1', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_1', content: 'Line 1\n' + 'A'.repeat(5000) },
+      // Turn 2
+      { role: 'assistant', content: 'Step 2', tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'grep', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_2', content: 'Match 1\n' + 'B'.repeat(3000) },
+      // Turn 3
+      { role: 'assistant', content: 'Step 3', tool_calls: [{ id: 'call_3', type: 'function', function: { name: 'edit', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_3', content: 'Successfully replaced 1 occurrence in foo.ts' },
+      // Turn 4 (most recent)
+      { role: 'assistant', content: 'Step 4', tool_calls: [{ id: 'call_4', type: 'function', function: { name: 'bash', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_4', content: 'All 10 tests passed' },
+    ];
+
+    // Keep the most recent 2 tool turns (call_3 and call_4)
+    const masked = compactor.maskOldToolObservations(messages, 2);
+
+    // 1. Tool 1 (older) should be masked
+    assert.strictEqual(masked[2].role, 'tool');
+    assert.strictEqual(masked[2].tool_call_id, 'call_1');
+    assert.ok(masked[2].content.includes('[Tool observation'));
+    assert.ok(masked[2].content.includes('compacted'));
+    assert.ok(masked[2].content.length < 300); // 5000 chars reduced to < 300!
+
+    // 2. Tool 2 (older) should be masked
+    assert.strictEqual(masked[4].role, 'tool');
+    assert.strictEqual(masked[4].tool_call_id, 'call_2');
+    assert.ok(masked[4].content.includes('[Tool observation'));
+    assert.ok(masked[4].content.length < 300);
+
+    // 3. Tool 3 and Tool 4 (recent) must retain their full raw content
+    assert.strictEqual(masked[6].content, 'Successfully replaced 1 occurrence in foo.ts');
+    assert.strictEqual(masked[8].content, 'All 10 tests passed');
+  });
+
+  test('9. ToolRouter: Role/Skill-based tool pruning eliminates schema token bloat', () => {
+    const registry = setupRegistry();
+    const router = new ToolRouter(registry);
+
+    // (A) Analyst skill receives ONLY read-only exploration tools (5 tools)
+    const analystSchemas = router.getActiveToolSchemas('turn_a', 'worker', 'analyst');
+    const analystToolNames = analystSchemas.map((s) => s.function.name);
+    assert.deepStrictEqual(analystToolNames.sort(), ['glob', 'grep', 'question', 'read', 'skill'].sort());
+    assert.ok(!analystToolNames.includes('edit'));
+    assert.ok(!analystToolNames.includes('write'));
+    assert.ok(!analystToolNames.includes('bash'));
+
+    // (B) QA skill receives test execution and exploration tools
+    const qaSchemas = router.getActiveToolSchemas('turn_q', 'worker', 'qa');
+    const qaToolNames = qaSchemas.map((s) => s.function.name);
+    assert.ok(qaToolNames.includes('bash'));
+    assert.ok(qaToolNames.includes('read'));
+    assert.ok(!qaToolNames.includes('edit'));
+    assert.ok(!qaToolNames.includes('write'));
+
+    // (C) Developer skill receives full suite
+    const devSchemas = router.getActiveToolSchemas('turn_d', 'worker', 'developer');
+    const devToolNames = devSchemas.map((s) => s.function.name);
+    assert.ok(devToolNames.includes('edit'));
+    assert.ok(devToolNames.includes('write'));
+    assert.ok(devToolNames.includes('bash'));
+  });
+
+  test('10. Prefix-Cache Invariance: System prompt prefix is 100% byte-for-byte identical across turns', () => {
+    const assembler = new DynamicContextAssembler();
+    const skillRegistry = new SkillRegistry();
+    const blackboard = new Blackboard('thread_cache_test');
+
+    skillRegistry.activateSkillForTurn('turn_1', 'developer');
+
+    // Turn 1
+    const contextTurn1 = assembler.assemble({
+      threadPrompt: 'Implement authentication middleware',
+      turnId: 'turn_1',
+      stage: 'worker',
+      currentMilestoneTitle: 'Token Validation',
+      currentMilestoneDescription: 'Validate JWT signatures',
+      blackboard,
+      skillRegistry,
+      recentMessages: [{ role: 'user', content: 'Begin step 1' }],
+    });
+
+    // Simulate usage of 5000 tokens during step 1
+    blackboard.recordTokenUsage(5000);
+
+    // Turn 2 (Next step of same milestone)
+    const contextTurn2 = assembler.assemble({
+      threadPrompt: 'Implement authentication middleware',
+      turnId: 'turn_1',
+      stage: 'worker',
+      currentMilestoneTitle: 'Token Validation',
+      currentMilestoneDescription: 'Validate JWT signatures',
+      blackboard,
+      skillRegistry,
+      recentMessages: [
+        { role: 'user', content: 'Begin step 1' },
+        { role: 'assistant', content: 'Read code' },
+      ],
+    });
+
+    // CRITICAL: The System Prompt must be 100% byte-for-byte IDENTICAL despite token usage changing!
+    const sysPrompt1 = contextTurn1[0].content as string;
+    const sysPrompt2 = contextTurn2[0].content as string;
+    assert.strictEqual(sysPrompt1, sysPrompt2, 'System prompt must remain identical for prefix cache hits');
+  });
 });
+

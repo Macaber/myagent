@@ -43,6 +43,7 @@ export class ThreadContext {
     this.blackboard = new Blackboard(this.threadId, this.db);
     this.telemetryStore = new TelemetryStore(this.db);
     this.eventStore = new EventStore(this.db);
+    this.turnCounter = this.telemetryStore.getTurnCount(this.threadId);
 
     // 1. Record thread start
     this.telemetryStore.recordThreadStart({
@@ -251,3 +252,9 @@ export class ThreadContext {
     return report;
   }
 }
+
+// Session conceptual aliases
+export const SessionContext = ThreadContext;
+export type SessionContext = ThreadContext;
+export type SessionContextConfig = ThreadContextConfig;
+

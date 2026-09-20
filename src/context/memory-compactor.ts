@@ -2,9 +2,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 export interface TruncationConfig {
-  maxCharacters?: number; // default 8000 (approx 2000 tokens)
-  headCharacters?: number; // default 1500
-  tailCharacters?: number; // default 1500
+  maxCharacters?: number; // default 4000 (approx 1000 tokens)
+  headCharacters?: number; // default 1200
+  tailCharacters?: number; // default 1200
   logDir?: string;
 }
 
@@ -15,9 +15,9 @@ export class MemoryCompactor {
   private readonly logDir?: string;
 
   constructor(config: TruncationConfig = {}) {
-    this.maxChars = config.maxCharacters ?? 8000;
-    this.headChars = config.headCharacters ?? 1500;
-    this.tailChars = config.tailCharacters ?? 1500;
+    this.maxChars = config.maxCharacters ?? 4000;
+    this.headChars = config.headCharacters ?? 1200;
+    this.tailChars = config.tailCharacters ?? 1200;
     this.logDir = config.logDir;
   }
 
@@ -131,4 +131,50 @@ export class MemoryCompactor {
       wasFolded: true,
     };
   }
+
+  /**
+   * Observation Masking (Sliding Window for Tool Outputs):
+   * Preserves full raw tool outputs for the most recent `keepRecentToolTurns` tool turns.
+   * For older tool outputs, condenses the content into a lightweight observation summary
+   * while STRICTLY preserving `role: 'tool'` and its matching `tool_call_id`.
+   * This breaks the O(N^2) token inflation in multi-turn ReAct loops.
+   */
+  public maskOldToolObservations<T extends { role: string; content?: any; tool_call_id?: string }>(
+    messages: T[],
+    keepRecentToolTurns: number = 2
+  ): T[] {
+    const toolIndices: number[] = [];
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === 'tool') {
+        toolIndices.push(i);
+      }
+    }
+
+    if (toolIndices.length <= keepRecentToolTurns) {
+      return messages;
+    }
+
+    // Retain full output for the most recent keepRecentToolTurns
+    const activeToolIndices = new Set(toolIndices.slice(-keepRecentToolTurns));
+
+    return messages.map((msg, idx) => {
+      if (msg.role !== 'tool' || activeToolIndices.has(idx)) {
+        return msg;
+      }
+
+      const rawContent = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content || '');
+      if (rawContent.length <= 250) {
+        return msg;
+      }
+
+      const firstLine = rawContent.split('\n')[0].slice(0, 120);
+      const maskedContent = `${firstLine}...\n[Tool observation (${rawContent.length} chars) compacted - processed in earlier reasoning step]`;
+
+      return {
+        ...msg,
+        content: maskedContent,
+      };
+    });
+  }
 }
+

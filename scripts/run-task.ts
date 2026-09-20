@@ -5,6 +5,7 @@ import { OpenAIProvider } from '../dist/provider/openai-provider.js';
 import { ThreadContext } from '../dist/runtime/thread-context.js';
 import { AcpClient } from '../dist/client/acp-client.js';
 import { createMemoryTransportPair } from '../dist/client/memory-transport.js';
+import { getDefaultDbPath } from '../dist/config/paths.js';
 
 async function main() {
   const workspaceRoot = process.cwd();
@@ -31,23 +32,42 @@ async function main() {
   }
 
   const autoApprove = process.argv.includes('--auto-approve') || process.env.AUTO_APPROVE === 'true';
-  const cleanArgs = process.argv.slice(2).filter((arg) => arg !== '--auto-approve');
-  const userPrompt = cleanArgs.join(' ').trim() ||
-    '分析当前项目的目录结构，并在 docs/project_overview.md 中编写一份清晰的模块概览。';
+  let resumeSessionId: string | undefined;
+  const rawArgs = process.argv.slice(2);
+  const cleanArgs: string[] = [];
+
+  for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg === '--auto-approve') continue;
+    if (arg.startsWith('--resume=')) {
+      resumeSessionId = arg.split('=')[1];
+    } else if (arg === '--resume' && rawArgs[i + 1]) {
+      resumeSessionId = rawArgs[++i];
+    } else {
+      cleanArgs.push(arg);
+    }
+  }
+
+  const promptInput = cleanArgs.join(' ').trim();
+  const defaultPrompt = '分析当前项目的目录结构，并在 docs/project_overview.md 中编写一份清晰的模块概览。';
+  const effectivePrompt = promptInput || (resumeSessionId ? '继续执行任务' : defaultPrompt);
 
   console.log(`\x1b[32m========================================================\x1b[0m`);
-  console.log(`\x1b[32m  MyAgent 长任务 Agent 运行时 - 实机测试控制台\x1b[0m`);
+  console.log(`\x1b[32m  MyAgent 会话与长任务 Agent 运行时 - 实机控制台\x1b[0m`);
   console.log(`\x1b[32m========================================================\x1b[0m`);
   console.log(`- Model:        \x1b[33m${provider.getModel()}\x1b[0m`);
   console.log(`- Auto-Approve: \x1b[33m${autoApprove ? '启用 (YES)' : '关闭 (需交互式确认)'}\x1b[0m`);
-  console.log(`- Task Goal:    \x1b[36m${userPrompt}\x1b[0m`);
+  if (resumeSessionId) {
+    console.log(`- Resume Mode:  \x1b[35m恢复历史会话 [${resumeSessionId}]\x1b[0m`);
+  }
+  console.log(`- Goal/Prompt:  \x1b[36m${effectivePrompt}\x1b[0m`);
   console.log(`--------------------------------------------------------\n`);
 
   const { clientTransport, serverTransport } = createMemoryTransportPair();
 
   const runtime = createAgentRuntime({
     workspaceRoot,
-    dbPath: path.join(workspaceRoot, '.agent', 'data.db'),
+    dbPath: getDefaultDbPath(),
     transport: serverTransport,
     provider,
   });
@@ -101,24 +121,48 @@ async function main() {
     }
   });
 
-  const threadId = `task_${Date.now()}`;
-  const thread = new ThreadContext(
-    {
-      threadId,
-      sessionId: `session_${Date.now()}`,
-      prompt: userPrompt,
-      workspacePath: workspaceRoot,
-    },
-    runtime.db,
-    runtime.dispatcher
-  );
+  const sessionId = resumeSessionId || `session_${Date.now()}`;
+  let thread: ThreadContext;
 
-  runtime.activeThreads.set(threadId, thread);
+  if (resumeSessionId) {
+    const existingThread = runtime.db.getRawDb().prepare(
+      'SELECT prompt, workspace_path FROM threads WHERE thread_id = ? OR session_id = ? LIMIT 1'
+    ).get(resumeSessionId, resumeSessionId) as any;
 
-  console.log(`[Runtime] 正在启动任务编排与执行...\n`);
+    thread = new ThreadContext(
+      {
+        threadId: resumeSessionId,
+        sessionId: resumeSessionId,
+        prompt: promptInput || existingThread?.prompt || '继续执行任务',
+        workspacePath: existingThread?.workspace_path || workspaceRoot,
+      },
+      runtime.db,
+      runtime.dispatcher
+    );
+  } else {
+    thread = new ThreadContext(
+      {
+        threadId: sessionId,
+        sessionId: sessionId,
+        prompt: effectivePrompt,
+        workspacePath: workspaceRoot,
+      },
+      runtime.db,
+      runtime.dispatcher
+    );
+  }
+
+  runtime.activeThreads.set(sessionId, thread);
+
+  console.log(`[Runtime] 正在启动会话编排与执行...\n`);
 
   try {
-    const report = await runtime.runner.runTask(thread);
+    let report;
+    if (resumeSessionId && !promptInput) {
+      report = await runtime.runner.resumeTask(thread);
+    } else {
+      report = await runtime.runner.runTask(thread);
+    }
 
     console.log(`\n\x1b[32m========================================================\x1b[0m`);
     console.log(`\x1b[32m  任务执行完毕！状态: ${report.status}\x1b[0m`);

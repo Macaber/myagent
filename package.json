@@ -8,13 +8,16 @@
     "myagent": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp -r src/dashboard/public dist/dashboard/",
     "watch": "tsc --watch",
     "start": "node dist/index.js",
     "dev": "node --no-warnings dist/index.js",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "task": "node --experimental-strip-types scripts/run-task.ts",
-    "tui": "node dist/tui/index.js"
+    "eval": "node --experimental-strip-types scripts/run-eval.ts",
+    "tooleval": "node --experimental-strip-types scripts/run-tooleval.ts",
+    "tui": "node dist/tui/index.js",
+    "dashboard": "node --experimental-strip-types scripts/dashboard-server.ts"
   },
   "keywords": [
     "agent",

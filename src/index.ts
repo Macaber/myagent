@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { AgentDatabase } from './persistence/db.js';
+import { getMyAgentHome, getDefaultDbPath, getSkillsDir, getMcpConfigPath, getEnvFilePath } from './config/paths.js';
 import { AcpTransport } from './protocol/transport.js';
 import { StdioTransport } from './protocol/stdio-transport.js';
 import { HttpTransport } from './protocol/http-transport.js';
@@ -237,13 +238,13 @@ export function resolveDefaultProvider(root: string): OpenAIProvider | undefined
     });
   }
 
-  // 1. Try loading .env from root or ~/.agent/.env
+  // 1. Try loading .env from root or ~/.myagent/.env
   try {
     const cwdEnv = path.join(root, '.env');
     if (fs.existsSync(cwdEnv) && typeof (process as any).loadEnvFile === 'function') {
       (process as any).loadEnvFile(cwdEnv);
     }
-    const homeAgentEnv = path.join(os.homedir(), '.agent', '.env');
+    const homeAgentEnv = getEnvFilePath();
     if (fs.existsSync(homeAgentEnv) && typeof (process as any).loadEnvFile === 'function') {
       (process as any).loadEnvFile(homeAgentEnv);
     }
@@ -540,6 +541,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         db,
         dispatcher
       );
+      const history = (fromDb.history && fromDb.history.length > 0)
+        ? fromDb.history
+        : db.synthesizeSessionHistory(params.sessionId);
+
       session = {
         sessionId: fromDb.sessionId,
         cwd: fromDb.cwd,
@@ -550,7 +555,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         currentModeId: fromDb.currentModeId || 'code',
         configOptions: fromDb.configOptions || createDefaultConfigOptions(true),
         mcpServers: [],
-        history: [],
+        history,
         thread,
         deleted: false,
         closed: false,
@@ -648,6 +653,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         db,
         dispatcher
       );
+      const history = (fromDb.history && fromDb.history.length > 0)
+        ? fromDb.history
+        : db.synthesizeSessionHistory(params.sessionId);
+
       session = {
         sessionId: fromDb.sessionId,
         cwd: fromDb.cwd,
@@ -658,7 +667,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         currentModeId: fromDb.currentModeId || 'code',
         configOptions: fromDb.configOptions || createDefaultConfigOptions(true),
         mcpServers: [],
-        history: [],
+        history,
         thread,
         deleted: false,
         closed: false,
@@ -897,6 +906,18 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
       dispatcher.emitSessionUpdate({
         sessionId: params.sessionId,
         update: usageUpdate,
+      });
+
+      // Persist full conversation history to database
+      db.saveAcpSession({
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        title: session.title,
+        additionalDirectories: session.additionalDirectories,
+        currentModeId: session.currentModeId,
+        configOptions: session.configOptions,
+        history: session.history,
+        updatedAt: Date.now(),
       });
 
       return {
@@ -1155,6 +1176,12 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
     sessions,
     activeThreads,
     clientBridge,
+    close: () => {
+      skillRegistry.closeWatchers();
+      db.close();
+      httpTransport?.close();
+      transport.close?.();
+    },
   };
 }
 
@@ -1193,7 +1220,7 @@ if (isDirectExecution()) {
   console.error(`[MyAgent] Starting Agent Runtime (mode: ${mode}, port: ${port})...`);
   const runtime = createAgentRuntime({
     workspaceRoot: process.cwd(),
-    dbPath: path.join(process.cwd(), '.agent', 'data.db'),
+    dbPath: getDefaultDbPath(),
     transportMode: mode,
     httpPort: port,
     autoDiscoverProvider: true,

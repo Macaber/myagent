@@ -37,7 +37,8 @@ export class WorkerAgent {
     milestone: Milestone,
     turnContext: TurnContext,
     toolContext: ToolExecutionContext,
-    userHint?: string
+    userHint?: string,
+    maxStepsOverride?: number
   ): Promise<WorkerExecutionResult> {
     // 1. Activate assigned L2 Skill for this turn (turn-scoped)
     const skillName = milestone.assignedSkill || 'developer';
@@ -55,7 +56,7 @@ export class WorkerAgent {
       },
     ];
 
-    const maxStepsPerTurn = Number(process.env.MAX_STEPS_PER_TURN) || 60;
+    const maxStepsPerTurn = maxStepsOverride ?? (Number(process.env.MAX_STEPS_PER_TURN) || 60);
     const maxModelIterations = Number(process.env.MAX_MODEL_ITERATIONS) || 12;
     const loopDetector = new LoopDetector(maxStepsPerTurn, 2, maxModelIterations);
     let forcedAnswerAttempt = false;
@@ -150,7 +151,7 @@ export class WorkerAgent {
         const isConversational = milestone.title === 'Direct Conversational Response';
         const activeToolSchemas = (isConversational || isForcingAnswer)
           ? undefined
-          : this.toolRouter.getActiveToolSchemas(turnContext.turnId, 'worker');
+          : this.toolRouter.getActiveToolSchemas(turnContext.turnId, 'worker', milestone.assignedSkill);
 
         const assembledMessages = this.contextAssembler.assemble({
           threadPrompt: toolContext.prompt || toolContext.threadId,

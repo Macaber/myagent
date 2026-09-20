@@ -2,33 +2,73 @@ import { AgentTool, ToolExecutionContext } from './tool-registry.js';
 import { SubagentManager } from '../runtime/subagent-manager.js';
 import { ThreadContext } from '../runtime/thread-context.js';
 
+export interface SubagentTaskSpec {
+  role: string;
+  taskDescription: string;
+  skillId?: string;
+  maxSteps?: number;
+}
+
+export interface InvokeSubagentParams {
+  role?: string;
+  taskDescription?: string;
+  skillId?: string;
+  maxSteps?: number;
+  subagents?: SubagentTaskSpec[];
+}
+
 export function createInvokeSubagentTool(
   subagentManager: SubagentManager,
   getThreadContext: (threadId: string) => ThreadContext | undefined
-): AgentTool<{ role: string; taskDescription: string; skillId?: string }> {
+): AgentTool<InvokeSubagentParams> {
   return {
     name: 'invoke_subagent',
     description:
-      'Spawn an autonomous Sub-agent with an isolated context window to execute a focused subtask (e.g. deep research, code refactoring, test execution). Prevents context overflow in the master agent.',
+      'Spawn one or more autonomous specialized subagents (e.g. "explore" for read-only codebase search, "coder" for editing, "qa" for tests). ' +
+      'Subagents run in isolated child threads with private contexts, preventing master context explosion. ' +
+      'Use the "subagents" array to dispatch multiple subagents concurrently in parallel.',
     riskLevel: 'READ_ONLY',
     parameters: {
       type: 'object',
       properties: {
+        subagents: {
+          type: 'array',
+          description:
+            'Dispatch multiple specialized subagents in parallel (e.g. parallel codebase exploration of different directories). Runs concurrently via Promise.all.',
+          items: {
+            type: 'object',
+            properties: {
+              role: {
+                type: 'string',
+                enum: ['explore', 'coder', 'qa', 'analyst', 'developer'],
+                description:
+                  'Specialized role: "explore" (strictly read-only codebase search/read), "coder" (code editing & writing), "qa" (test execution & diagnosis)',
+              },
+              taskDescription: {
+                type: 'string',
+                description: 'Clear, actionable instructions for the subagent',
+              },
+              maxSteps: {
+                type: 'number',
+                description: 'Optional step limit (default 8 for explore, 10 for coder)',
+              },
+            },
+            required: ['role', 'taskDescription'],
+          },
+        },
         role: {
           type: 'string',
-          description: 'Descriptive role of the subagent (e.g. "Documentation Researcher", "Component Refactorer")',
+          description: 'Single subagent role (e.g. "explore", "coder", "qa")',
         },
         taskDescription: {
           type: 'string',
-          description: 'Detailed, actionable instructions for the subagent to perform',
+          description: 'Single subagent task instructions',
         },
-        skillId: {
-          type: 'string',
-          enum: ['analyst', 'developer', 'qa'],
-          description: 'Optional skill profile to equip the subagent with',
+        maxSteps: {
+          type: 'number',
+          description: 'Optional step limit for single subagent',
         },
       },
-      required: ['role', 'taskDescription'],
     },
     async execute(params, context: ToolExecutionContext) {
       const parentThread = getThreadContext(context.threadId);
@@ -36,17 +76,30 @@ export function createInvokeSubagentTool(
         throw new Error(`Parent thread '${context.threadId}' not found for subagent invocation`);
       }
 
-      const result = await subagentManager.runSubagent(parentThread, {
-        role: params.role,
-        taskDescription: params.taskDescription,
-        skillId: params.skillId,
-      });
+      const tasks: SubagentTaskSpec[] = [];
 
-      return (
-        `[Sub-agent '${params.role}' (${result.subagentId}) Finished with status: ${result.status}]\n` +
-        `Execution Duration: ${result.durationMs}ms | Tokens: ${result.tokens.totalTokens}\n` +
-        `Summary of Findings & Results:\n${result.summary}`
-      );
+      if (params.subagents && Array.isArray(params.subagents) && params.subagents.length > 0) {
+        for (const s of params.subagents) {
+          tasks.push({
+            role: s.role || 'explore',
+            taskDescription: s.taskDescription,
+            skillId: s.skillId,
+            maxSteps: s.maxSteps,
+          });
+        }
+      } else if (params.role && params.taskDescription) {
+        tasks.push({
+          role: params.role,
+          taskDescription: params.taskDescription,
+          skillId: params.skillId,
+          maxSteps: params.maxSteps,
+        });
+      } else {
+        throw new Error('invoke_subagent requires either "subagents" array or "role" and "taskDescription"');
+      }
+
+      const results = await subagentManager.runSubagentsBatch(parentThread, tasks);
+      return SubagentManager.formatSubagentResults(results);
     },
   };
 }

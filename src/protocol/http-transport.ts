@@ -1,6 +1,7 @@
 import * as http from 'node:http';
 import { AcpTransport, MessageHandler } from './transport.js';
 import { JsonRpcRequest, JsonRpcResponse, JsonRpcNotification, ACP_ERROR_CODES } from './types.js';
+import { handleDashboardHttpRequest } from '../dashboard/dashboard-router.js';
 
 export interface HttpTransportOptions {
   port?: number;
@@ -120,6 +121,11 @@ export class HttpTransport implements AcpTransport {
     }
 
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+    // Dashboard & Telemetry API
+    if (handleDashboardHttpRequest(req, res, url)) {
+      return;
+    }
 
     // GET /health
     if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/')) {

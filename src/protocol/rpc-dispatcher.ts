@@ -56,6 +56,17 @@ export class RpcDispatcher {
     this.methodHandlers.set(method, handler);
   }
 
+  public async callMethod<TParams = any, TResult = any>(
+    method: string,
+    params: TParams
+  ): Promise<TResult> {
+    const handler = this.methodHandlers.get(method);
+    if (!handler) {
+      throw new Error(`Method '${method}' not found`);
+    }
+    return handler(params);
+  }
+
   public registerNotification<TParams>(
     method: string,
     handler: RpcNotificationHandler<TParams>

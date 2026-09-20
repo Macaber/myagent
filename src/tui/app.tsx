@@ -20,6 +20,7 @@ export interface AppProps {
   sessionId: string;
   modelName: string;
   workspacePath: string;
+  initialUpdates?: any[];
   onExit?: () => void;
 }
 
@@ -28,12 +29,63 @@ export const App: React.FC<AppProps> = ({
   sessionId,
   modelName,
   workspacePath,
+  initialUpdates,
   onExit,
 }) => {
   const { exit } = useApp();
   const [state, setState] = useState<AgentRuntimeState>('IDLE');
   const [plan, setPlan] = useState<PlanData | undefined>();
-  const [messages, setMessages] = useState<UIMessage[]>([]);
+  const [currentActiveSessionId, setCurrentActiveSessionId] = useState<string>(sessionId);
+
+  // Initialize messages from replayed history if resuming
+  const [messages, setMessages] = useState<UIMessage[]>(() => {
+    if (!initialUpdates || initialUpdates.length === 0) return [];
+    const restored: UIMessage[] = [];
+    for (const notif of initialUpdates) {
+      const up = notif?.update || notif;
+      const type = notif?.updateType || up?.sessionUpdate || notif?.sessionUpdate;
+      const content = notif?.content || up?.content;
+      const text = typeof content === 'string' ? content : content?.text || '';
+
+      if (type === 'user_message_chunk' && text) {
+        restored.push({
+          id: `hist_u_${restored.length}`,
+          type: 'user',
+          content: text,
+          timestamp: Date.now(),
+        });
+      } else if (type === 'agent_message_chunk' && text) {
+        restored.push({
+          id: `hist_a_${restored.length}`,
+          type: 'agent',
+          content: text,
+          timestamp: Date.now(),
+        });
+      } else if (type === 'tool_call' && up?.title) {
+        restored.push({
+          id: `hist_t_${up.callId || restored.length}`,
+          type: 'tool',
+          toolCall: {
+            id: up.callId || `tool_${restored.length}`,
+            name: up.title,
+            argsSummary: up.rawInput ? JSON.stringify(up.rawInput) : '',
+            status: 'completed',
+            startedAt: Date.now(),
+          },
+          timestamp: Date.now(),
+        });
+      }
+    }
+    if (restored.length > 0) {
+      restored.push({
+        id: `sys_resume_notice_${Date.now()}`,
+        type: 'system',
+        content: `🔄 已恢复历史会话 [${sessionId}]，共重构 ${restored.length} 条交互记录。您可以直接输入新消息继续对话。`,
+        timestamp: Date.now(),
+      });
+    }
+    return restored;
+  });
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | undefined>();
   const [stats, setStats] = useState<TelemetryStats>({
     elapsedSeconds: 0,
@@ -300,16 +352,110 @@ export const App: React.FC<AppProps> = ({
               type: 'system',
               content:
                 '📖 可用命令与快捷键说明:\n' +
-                '  /help    - 显示本帮助信息\n' +
-                '  /clear   - 清空屏幕历史消息流\n' +
-                '  /status  - 显示当前会话状态、Token 消耗与耗时\n' +
-                '  /exit    - 退出 TUI 终端界面\n' +
-                '  Ctrl+C   - 任务运行中中断任务 / 空闲状态退出程序\n' +
-                '  Esc      - 关闭/拒绝当前的权限审批弹框',
+                '  /help     - 显示本帮助信息\n' +
+                '  /sessions - 查看历史会话列表\n' +
+                '  /resume   - 切换/恢复历史会话 (/resume <sessionId>)\n' +
+                '  /clear    - 清空屏幕历史消息流\n' +
+                '  /status   - 显示当前会话状态、Token 消耗与耗时\n' +
+                '  /exit     - 退出 TUI 终端界面\n' +
+                '  Ctrl+C    - 任务运行中中断任务 / 空闲状态退出程序\n' +
+                '  Esc       - 关闭/拒绝当前的权限审批弹框',
               timestamp: Date.now(),
             },
           ]);
           return;
+
+        case '/sessions': {
+          try {
+            const listRes = await client.listSessions({ cwd: workspacePath });
+            const items = listRes.sessions || [];
+            if (items.length === 0) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: `sys_${Date.now()}`,
+                  type: 'system',
+                  content: '当前工作区暂无历史会话。',
+                  timestamp: Date.now(),
+                },
+              ]);
+            } else {
+              const formatted = items.slice(0, 10).map((s, idx) =>
+                `  ${idx + 1}. [${s.sessionId}] (${new Date(s.updatedAt || Date.now()).toLocaleString()}) ${s.title || ''}`
+              ).join('\n');
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: `sys_${Date.now()}`,
+                  type: 'system',
+                  content: `📋 最近历史会话列表 (输入 /resume <sessionId> 恢复切入):\n${formatted}`,
+                  timestamp: Date.now(),
+                },
+              ]);
+            }
+          } catch (err: any) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `sys_${Date.now()}`,
+                type: 'system',
+                content: `获取会话列表失败: ${err.message}`,
+                timestamp: Date.now(),
+              },
+            ]);
+          }
+          return;
+        }
+
+        case '/resume': {
+          const targetId = parts[1]?.trim();
+          if (!targetId) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `sys_${Date.now()}`,
+                type: 'system',
+                content: '用法: /resume <sessionId>。可先输入 /sessions 查看历史会话列表。',
+                timestamp: Date.now(),
+              },
+            ]);
+            return;
+          }
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `sys_${Date.now()}`,
+              type: 'system',
+              content: `🔄 正在载入并恢复历史会话: ${targetId}...`,
+              timestamp: Date.now(),
+            },
+          ]);
+          try {
+            setMessages([]);
+            await client.loadSession(targetId);
+            setCurrentActiveSessionId(targetId);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `sys_${Date.now()}`,
+                type: 'system',
+                content: `✅ 已切换至历史会话 [${targetId}]，您可以直接发送后续消息继续对话。`,
+                timestamp: Date.now(),
+              },
+            ]);
+          } catch (err: any) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `sys_${Date.now()}`,
+                type: 'system',
+                content: `❌ 载入会话失败: ${err.message}`,
+                timestamp: Date.now(),
+              },
+            ]);
+          }
+          return;
+        }
 
         case '/clear':
           setMessages([]);
@@ -324,7 +470,7 @@ export const App: React.FC<AppProps> = ({
               content:
                 `📊 当前运行状态:\n` +
                 `  - 状态: ${state}\n` +
-                `  - 会话 ID: ${sessionId}\n` +
+                `  - 会话 ID: ${currentActiveSessionId}\n` +
                 `  - 运行耗时: ${stats.elapsedSeconds} 秒\n` +
                 `  - 总 Token: ${stats.totalTokens.toLocaleString()}\n` +
                 `  - 工具调用: ${stats.toolCallsCount} 次`,
@@ -370,7 +516,7 @@ export const App: React.FC<AppProps> = ({
     setState('RUNNING');
 
     try {
-      const result = await client.promptSession(sessionId, text);
+      const result = await client.promptSession(currentActiveSessionId, text);
       if (result.status === 'completed') {
         setState('COMPLETED');
       } else if (result.status === 'blocked' || result.stopReason === 'requires_action') {

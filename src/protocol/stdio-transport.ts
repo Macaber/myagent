@@ -38,6 +38,11 @@ export class StdioTransport implements AcpTransport {
   public close(): void {
     this.isClosed = true;
     try {
+      if (this.input === process.stdin) {
+        try {
+          process.stdin.pause?.();
+        } catch {}
+      }
       (this.input as any).pause?.();
       (this.input as any).removeAllListeners?.('data');
       (this.input as any).unref?.();
