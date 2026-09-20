@@ -105,4 +105,57 @@ describe('Security & HITL Approval Gate', () => {
     });
     assert.strictEqual(callCount, 1, 'Should not prompt user again after APPROVED_ALWAYS');
   });
+
+  test('PolicyEngine auto-approves safe read-only workspace inspection commands', () => {
+    // Safe read-only inspection commands within workspace should NOT require approval
+    const safe1 = policy.evaluateToolCall({
+      toolName: 'bash',
+      riskLevel: 'HIGH_RISK_EXEC',
+      command: 'cat src/app.ts',
+    });
+    assert.strictEqual(safe1.requiresApproval, false, 'cat within workspace should be auto-approved');
+
+    const safe2 = policy.evaluateToolCall({
+      toolName: 'bash',
+      riskLevel: 'HIGH_RISK_EXEC',
+      command: 'od -c hello.txt && wc -c hello.txt',
+    });
+    assert.strictEqual(safe2.requiresApproval, false, 'chained od and wc should be auto-approved');
+
+    const safe3 = policy.evaluateToolCall({
+      toolName: 'bash',
+      riskLevel: 'HIGH_RISK_EXEC',
+      command: 'git status',
+    });
+    assert.strictEqual(safe3.requiresApproval, false, 'git status should be auto-approved');
+
+    // Dangerous or mutating commands MUST require approval
+    const unsafe1 = policy.evaluateToolCall({
+      toolName: 'bash',
+      riskLevel: 'HIGH_RISK_EXEC',
+      command: 'cat /etc/shadow',
+    });
+    assert.strictEqual(unsafe1.requiresApproval, true, 'cat outside workspace must require approval');
+
+    const unsafe2 = policy.evaluateToolCall({
+      toolName: 'bash',
+      riskLevel: 'HIGH_RISK_EXEC',
+      command: 'cat .env',
+    });
+    assert.strictEqual(unsafe2.requiresApproval, true, 'cat sensitive file must require approval');
+
+    const unsafe3 = policy.evaluateToolCall({
+      toolName: 'bash',
+      riskLevel: 'HIGH_RISK_EXEC',
+      command: 'echo "hi" > evil.sh',
+    });
+    assert.strictEqual(unsafe3.requiresApproval, true, 'output redirection must require approval');
+
+    const unsafe4 = policy.evaluateToolCall({
+      toolName: 'bash',
+      riskLevel: 'HIGH_RISK_EXEC',
+      command: 'rm -rf data',
+    });
+    assert.strictEqual(unsafe4.requiresApproval, true, 'rm command must require approval');
+  });
 });

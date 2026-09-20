@@ -91,9 +91,13 @@ Each milestone MUST be concrete, sequentially ordered, and specify dependencies 
 Available worker skills: "analyst", "developer", "qa".
 
 PLANNING RULES:
-1. For informational questions, explanations, or codebase inquiries: Create a SINGLE milestone (assignedSkill: "analyst"). Do NOT add implementation or QA milestones if no code changes are requested.
-2. For implementation tasks or bug fixes: Decompose into 2-3 logical milestones (e.g. analyze, implement, verify).
-3. Do NOT instruct workers to run bash commands or modify files unless specifically needed for the user's request.
+1. For informational questions, explanations, directory inspection, or codebase inquiries: Create a SINGLE milestone (assignedSkill: "analyst"). Do NOT add implementation or QA milestones.
+2. For simple single-step tasks (e.g. creating/deleting a file, minor single-file edits, running a specific script, or small localized edits): Create a SINGLE milestone (assignedSkill: "developer"). The developer can create, write, and verify within this single milestone. Do NOT create separate QA or verification milestones for simple file operations.
+3. Only for complex multi-step feature implementations, major refactorings, or tasks explicitly requiring full test suite execution: Decompose into 2-3 logical milestones (e.g. implement, verify).
+4. ACCEPTANCE CRITERIA FORMATTING:
+   - For file creation or verification: Use format "file_exists: <path>" (e.g. "file_exists: hello.txt") or describe the condition in plain text. NEVER use "cmd: cat ..." to verify files!
+   - For test/build execution: Use "cmd: <command>" where <command> MUST be ONLY a valid shell command (e.g. "cmd: npm test"). NEVER append natural language comments, Chinese explanations, or expected output to the "cmd:" line.
+5. Workers must prefer safe built-in tools (read, write, edit, glob, grep). Do NOT instruct workers to run shell commands (like cat, od, wc) for inspecting files when read/glob tools can do it.
 
 Output ONLY valid JSON matching this schema:
 {
@@ -105,7 +109,7 @@ Output ONLY valid JSON matching this schema:
       "description": string,
       "dependencies": string[] (array of milestone IDs that must complete first),
       "assignedSkill": "analyst" | "developer" | "qa",
-      "acceptanceCriteria": string (e.g. "cmd: npm test" or explicit file existence condition)
+      "acceptanceCriteria": string (e.g. "file_exists: hello.txt" or "cmd: npm test")
     }
   ]
 }`;

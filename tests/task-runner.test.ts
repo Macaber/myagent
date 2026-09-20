@@ -72,4 +72,63 @@ describe('TaskRunner End-to-End Execution', () => {
 
     db.close();
   });
+
+  test('Seamlessly verifies file creation with Chinese cmd: criteria without shell execution', async () => {
+    const db = new AgentDatabase();
+    const toolRegistry = new ToolRegistry();
+    let bashInvoked = false;
+    toolRegistry.registerTool({
+      ...bashTool,
+      async execute(params: any, ctx: any) {
+        bashInvoked = true;
+        return bashTool.execute(params, ctx);
+      },
+    });
+    toolRegistry.registerTool(writeTool);
+    toolRegistry.registerTool(readTool);
+
+    const skillRegistry = new SkillRegistry();
+    const verificationGuard = new VerificationGuard(toolRegistry);
+
+    const threadId = 'task_file_001';
+    const thread = new ThreadContext(
+      {
+        threadId,
+        sessionId: 'sess_file',
+        prompt: '帮我创建一个 txt文件，内容是你好',
+        workspacePath: testDir,
+      },
+      db
+    );
+
+    const targetFile = path.join(testDir, 'hello_test.txt');
+    // Pre-create the file to simulate developer writing it
+    fs.writeFileSync(targetFile, '你好', 'utf8');
+
+    const criteria = `cmd: cat ${targetFile} 输出为“你好”；判定通过条件为文件存在且内容与“你好”完全一致。`;
+    const milestone = {
+      id: 'ms_1',
+      title: '创建包含“你好”的文本文件',
+      description: '新建 hello_test.txt 并写入 你好',
+      dependencies: [],
+      assignedSkill: 'developer',
+      acceptanceCriteria: criteria,
+      resultSummary: '文件 hello_test.txt 创建成功，内容为 你好',
+      status: 'WAITING' as const,
+    };
+
+    const toolContext = {
+      threadId: thread.threadId,
+      workspaceJail: thread.workspaceJail,
+      blackboard: thread.blackboard,
+    };
+    const verification = await verificationGuard.verifyMilestone(milestone, toolContext as any);
+
+    assert.strictEqual(verification.passed, true);
+    assert.strictEqual(bashInvoked, false, 'Should verify natively without triggering bash approval');
+
+    // Clean up
+    if (fs.existsSync(targetFile)) fs.unlinkSync(targetFile);
+    db.close();
+  });
 });

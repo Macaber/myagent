@@ -59,6 +59,7 @@ export class WorkerAgent {
     const maxModelIterations = Number(process.env.MAX_MODEL_ITERATIONS) || 12;
     const loopDetector = new LoopDetector(maxStepsPerTurn, 2, maxModelIterations);
     let forcedAnswerAttempt = false;
+    let consecutiveVerificationFailures = 0;
 
     // If no LLM provider (offline/mock mode), perform direct mock execution
     if (!this.provider) {
@@ -375,6 +376,16 @@ export class WorkerAgent {
               summary: milestone.resultSummary,
             };
           } else {
+            consecutiveVerificationFailures++;
+            if (consecutiveVerificationFailures >= 2) {
+              return {
+                status: 'BLOCKED',
+                summary: `Milestone '${milestone.title}' failed acceptance verification after ${consecutiveVerificationFailures} attempts.`,
+                error: verification.message,
+                remedySuggestion: 'Please verify the milestone criteria or resolve the failing check.',
+              };
+            }
+
             // Verification failed -> Feed back to LLM to self-heal
             localTurnMessages.push({
               role: 'user',
