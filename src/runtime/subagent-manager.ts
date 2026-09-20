@@ -22,6 +22,8 @@ export interface SubagentExecutionResult {
   summary: string;
   durationMs: number;
   tokens: TokenUsage;
+  childThreadId?: string;
+  stepCount?: number;
 }
 
 export class SubagentManager {
@@ -61,10 +63,11 @@ export class SubagentManager {
 
     const cards = results.map((r, idx) => {
       const icon = r.status === 'SUCCESS' ? '✅' : '❌';
+      const stepsInfo = r.stepCount !== undefined ? ` | ${r.stepCount} steps` : '';
       return (
         `### ${icon} [Subagent ${idx + 1}: ${r.role.toUpperCase()}] (${r.subagentId})\n` +
         `- **执行状态**: ${r.status}\n` +
-        `- **耗时 / Tokens**: ${(r.durationMs / 1000).toFixed(2)}s | ${r.tokens?.totalTokens || 0} tokens\n` +
+        `- **耗时 / 步骤 / Tokens**: ${(r.durationMs / 1000).toFixed(2)}s${stepsInfo} | ${r.tokens?.totalTokens || 0} tokens\n` +
         `- **核心调研事实与结果报告**:\n${r.summary.trim()}`
       );
     });
@@ -221,6 +224,8 @@ export class SubagentManager {
       summary: workerResult.summary,
       durationMs: report.totalDurationMs,
       tokens: report.totalTokens,
+      childThreadId,
+      stepCount: report.counts?.steps || 0,
     };
   }
 }

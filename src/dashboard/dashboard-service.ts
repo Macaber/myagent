@@ -76,6 +76,7 @@ export interface StepDetail {
   };
   errorMessage: string | null;
   metadata: any;
+  subagentSteps?: StepDetail[];
 }
 
 export interface TurnDetail {
@@ -109,6 +110,7 @@ export interface ThreadDetailReport {
   thread: ThreadTreeItem;
   parentThread?: {
     threadId: string;
+    sessionId?: string;
     prompt: string;
     role: string;
   };
@@ -122,6 +124,7 @@ export interface ThreadDetailReport {
   }>;
   subagentsSummary: Array<{
     threadId: string;
+    sessionId?: string;
     role: string;
     prompt: string;
     totalTokens: number;
@@ -208,7 +211,32 @@ export class DashboardService {
   private static openDb(targetPath: string): DatabaseSync | null {
     if (!fs.existsSync(targetPath)) return null;
     try {
-      return new DatabaseSync(targetPath);
+      const db = new DatabaseSync(targetPath);
+      // Auto-migrate any unmigrated task_ IDs to canonical session_ IDs
+      try {
+        const legacyRows = db.prepare(
+          "SELECT thread_id, session_id FROM threads WHERE thread_id LIKE 'task_%'"
+        ).all() as Array<{ thread_id: string; session_id: string | null }>;
+
+        if (legacyRows.length > 0) {
+          db.exec('PRAGMA foreign_keys = OFF;');
+          for (const row of legacyRows) {
+            const targetSessionId = (row.session_id && row.session_id.startsWith('session_'))
+              ? row.session_id
+              : row.thread_id.replace(/^task_/, 'session_');
+
+            db.prepare('UPDATE threads SET thread_id = ?, session_id = ? WHERE thread_id = ?').run(targetSessionId, targetSessionId, row.thread_id);
+            db.prepare('UPDATE turns SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+            db.prepare('UPDATE steps SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+            db.prepare('UPDATE task_events SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+            db.prepare('UPDATE blackboard_entries SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+            db.prepare('UPDATE artifacts SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+            db.prepare('UPDATE threads SET parent_thread_id = ? WHERE parent_thread_id = ?').run(targetSessionId, row.thread_id);
+          }
+          db.exec('PRAGMA foreign_keys = ON;');
+        }
+      } catch {}
+      return db;
     } catch (err) {
       console.error(`[DashboardService] Failed to open SQLite DB at ${targetPath}:`, err);
       return null;
@@ -257,11 +285,18 @@ export class DashboardService {
           SUM(total_prompt_tokens) as totalPromptTokens,
           SUM(total_completion_tokens) as totalCompletionTokens,
           SUM(total_tokens) as totalTokens,
-          SUM(total_duration_ms) as totalDurationMs,
-          SUM(total_turns) as totalTurns,
-          SUM(total_steps) as totalSteps
+          SUM(total_duration_ms) as totalDurationMs
         FROM threads
       `).get() as any;
+
+      // Count actual user interaction turns in main threads and aggregate durations
+      const turnsCountRow = db.prepare(`
+        SELECT COUNT(*) as totalTurns, COALESCE(SUM(duration_ms), 0) as turnsDuration FROM turns
+        WHERE thread_id IN (SELECT thread_id FROM threads WHERE parent_thread_id IS NULL)
+      `).get() as any;
+
+      const durationMs = Math.max(Number(threadStats?.totalDurationMs || 0), Number(turnsCountRow?.turnsDuration || 0));
+      const totalTurns = Number(turnsCountRow?.totalTurns || 0);
 
       const statusRows = db.prepare(`
         SELECT current_state, COUNT(*) as c FROM threads GROUP BY current_state
@@ -272,7 +307,7 @@ export class DashboardService {
         statusCounts[row.current_state] = Number(row.c);
       }
 
-      // 2. Tool and step counts
+      // 2. Tool and step counts (all steps in DB, including subagents!)
       const toolStats = db.prepare(`
         SELECT
           COUNT(*) as totalSteps,
@@ -293,9 +328,9 @@ export class DashboardService {
           completion: Number(threadStats?.totalCompletionTokens || 0),
           total: Number(threadStats?.totalTokens || 0),
         },
-        totalDurationMs: Number(threadStats?.totalDurationMs || 0),
-        totalTurns: Number(threadStats?.totalTurns || 0),
-        totalSteps: Number(threadStats?.totalSteps || 0),
+        totalDurationMs: durationMs,
+        totalTurns,
+        totalSteps: Number(toolStats?.totalSteps || 0),
         totalToolCalls: Number(toolStats?.toolCalls || 0),
         totalSubagentCalls: Number(toolStats?.subagentCalls || 0),
         totalSkillCalls: Number(toolStats?.skillCalls || 0),
@@ -344,7 +379,7 @@ export class DashboardService {
 
         const item: ThreadTreeItem = {
           threadId: r.thread_id,
-          sessionId: r.session_id,
+          sessionId: r.session_id || r.thread_id,
           parentThreadId: r.parent_thread_id || null,
           role,
           currentState: r.current_state,
@@ -364,13 +399,16 @@ export class DashboardService {
           errorMessage: r.error_message || null,
           children: [],
         };
-        itemMap.set(item.threadId, item);
+        itemMap.set(r.thread_id, item);
       }
 
       // Build hierarchy
       for (const item of itemMap.values()) {
         if (item.parentThreadId && itemMap.has(item.parentThreadId)) {
-          itemMap.get(item.parentThreadId)!.children.push(item);
+          const parent = itemMap.get(item.parentThreadId)!;
+          if (!parent.children.some(c => c.threadId === item.threadId)) {
+            parent.children.push(item);
+          }
         } else {
           rootItems.push(item);
         }
@@ -401,8 +439,12 @@ export class DashboardService {
     if (!db) return null;
 
     try {
-      const threadRow = db.prepare('SELECT * FROM threads WHERE thread_id = ?').get(threadId) as any;
+      const mappedId = threadId.startsWith('task_') ? threadId.replace(/^task_/, 'session_') : (threadId.startsWith('session_') ? threadId.replace(/^session_/, 'task_') : threadId);
+      const threadRow = db.prepare('SELECT * FROM threads WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ? LIMIT 1').get(threadId, threadId, mappedId, mappedId) as any;
       if (!threadRow) return null;
+
+      const effectiveId = threadRow.session_id || threadRow.thread_id;
+      const actualThreadId = threadRow.thread_id;
 
       let role = 'main';
       const promptStr = String(threadRow.prompt || '');
@@ -416,8 +458,8 @@ export class DashboardService {
       const duration = Number(threadRow.total_duration_ms) || (threadRow.completed_at ? Number(threadRow.completed_at) - Number(threadRow.created_at) : Date.now() - Number(threadRow.created_at));
 
       const threadItem: ThreadTreeItem = {
-        threadId: threadRow.thread_id,
-        sessionId: threadRow.session_id,
+        threadId: actualThreadId,
+        sessionId: effectiveId,
         parentThreadId: threadRow.parent_thread_id || null,
         role,
         currentState: threadRow.current_state,
@@ -439,12 +481,14 @@ export class DashboardService {
       };
 
       // Check if parent exists
-      let parentThread: { threadId: string; prompt: string; role: string } | undefined;
+      let parentThread: { threadId: string; sessionId?: string; prompt: string; role: string } | undefined;
       if (threadRow.parent_thread_id) {
-        const parentRow = db.prepare('SELECT thread_id, prompt FROM threads WHERE thread_id = ?').get(threadRow.parent_thread_id) as any;
+        const parentRow = db.prepare('SELECT thread_id, session_id, prompt FROM threads WHERE thread_id = ? OR session_id = ?').get(threadRow.parent_thread_id, threadRow.parent_thread_id) as any;
         if (parentRow) {
+          const parentEffectiveId = parentRow.session_id || parentRow.thread_id;
           parentThread = {
-            threadId: parentRow.thread_id,
+            threadId: parentEffectiveId,
+            sessionId: parentEffectiveId,
             prompt: parentRow.prompt,
             role: 'main',
           };
@@ -453,16 +497,18 @@ export class DashboardService {
 
       // Child subagents for this thread
       const childRows = db.prepare(`
-        SELECT thread_id, prompt, current_state, total_tokens, total_duration_ms
-        FROM threads WHERE parent_thread_id = ? ORDER BY created_at ASC
-      `).all(threadId) as any[];
+        SELECT thread_id, session_id, prompt, current_state, total_tokens, total_duration_ms
+        FROM threads WHERE parent_thread_id = ? OR parent_thread_id = ? ORDER BY created_at ASC
+      `).all(actualThreadId, effectiveId) as any[];
 
       const subagentsSummary = childRows.map((c) => {
         let childRole = 'explore';
         const m = String(c.prompt).match(/^\[Subagent:\s*([^\]]+)\]/i);
         if (m) childRole = m[1].trim();
+        const childEffectiveId = c.session_id || c.thread_id;
         return {
-          threadId: c.thread_id,
+          threadId: childEffectiveId,
+          sessionId: childEffectiveId,
           role: childRole,
           prompt: c.prompt,
           totalTokens: Number(c.total_tokens),
@@ -471,15 +517,63 @@ export class DashboardService {
         };
       });
 
+      // Query child threads steps so invoke_subagent steps can nest them
+      const childThreadIds = childRows.map((c) => c.thread_id);
+      const childStepsMap = new Map<string, StepDetail[]>();
+
+      if (childThreadIds.length > 0) {
+        const placeholders = childThreadIds.map(() => '?').join(',');
+        const childStepRows = db.prepare(`
+          SELECT * FROM steps WHERE thread_id IN (${placeholders}) ORDER BY step_index ASC
+        `).all(...childThreadIds) as any[];
+
+        for (const cs of childStepRows) {
+          let parsedMetadata: any = null;
+          if (cs.metadata) {
+            try {
+              parsedMetadata = JSON.parse(cs.metadata);
+            } catch {
+              parsedMetadata = cs.metadata;
+            }
+          }
+          const csDetail: StepDetail = {
+            stepId: cs.step_id,
+            turnId: cs.turn_id,
+            threadId: cs.thread_id,
+            stepIndex: Number(cs.step_index),
+            stepType: cs.step_type,
+            toolName: cs.tool_name || null,
+            isSubagent: false,
+            isSkill: cs.tool_name === 'skill',
+            status: cs.status,
+            startedAt: Number(cs.started_at),
+            completedAt: cs.completed_at ? Number(cs.completed_at) : null,
+            durationMs: Number(cs.duration_ms),
+            tokens: {
+              prompt: Number(cs.prompt_tokens),
+              completion: Number(cs.completion_tokens),
+              total: Number(cs.total_tokens),
+            },
+            errorMessage: cs.error_message || null,
+            metadata: parsedMetadata,
+          };
+
+          if (!childStepsMap.has(cs.thread_id)) {
+            childStepsMap.set(cs.thread_id, []);
+          }
+          childStepsMap.get(cs.thread_id)!.push(csDetail);
+        }
+      }
+
       // Query turns
       const turnRows = db.prepare(`
-        SELECT * FROM turns WHERE thread_id = ? ORDER BY turn_index ASC
-      `).all(threadId) as any[];
+        SELECT * FROM turns WHERE thread_id = ? OR thread_id = ? ORDER BY turn_index ASC
+      `).all(actualThreadId, effectiveId) as any[];
 
       // Query steps
       const stepRows = db.prepare(`
-        SELECT * FROM steps WHERE thread_id = ? ORDER BY turn_id, step_index ASC
-      `).all(threadId) as any[];
+        SELECT * FROM steps WHERE thread_id = ? OR thread_id = ? ORDER BY turn_id, step_index ASC
+      `).all(actualThreadId, effectiveId) as any[];
 
       const stepsByTurn = new Map<string, StepDetail[]>();
 
@@ -505,6 +599,18 @@ export class DashboardService {
           skillName = parsedMetadata.args.skillName;
         }
 
+        let subagentSteps: StepDetail[] | undefined;
+        if (isSubagent && childRows.length > 0) {
+          // Find matching child thread
+          const matched = childRows.find((c) => {
+            if (subagentRole && c.role === subagentRole) return true;
+            return true;
+          });
+          if (matched && childStepsMap.has(matched.thread_id)) {
+            subagentSteps = childStepsMap.get(matched.thread_id);
+          }
+        }
+
         const stepDetail: StepDetail = {
           stepId: s.step_id,
           turnId: s.turn_id,
@@ -527,6 +633,7 @@ export class DashboardService {
           },
           errorMessage: s.error_message || null,
           metadata: parsedMetadata,
+          subagentSteps,
         };
 
         if (!stepsByTurn.has(s.turn_id)) {
@@ -543,6 +650,7 @@ export class DashboardService {
         let subagentCallsCount = 0;
         let skillCallsCount = 0;
         let modelCallsCount = 0;
+        let extraSubagentSteps = 0;
 
         for (const st of turnSteps) {
           if (st.stepType === 'MODEL_CALL') {
@@ -550,7 +658,20 @@ export class DashboardService {
           } else if (st.stepType === 'TOOL_EXECUTION' && st.toolName) {
             toolCallsCount++;
             toolsUsed[st.toolName] = (toolsUsed[st.toolName] || 0) + 1;
-            if (st.isSubagent) subagentCallsCount++;
+            if (st.isSubagent) {
+              subagentCallsCount++;
+              if (st.subagentSteps && st.subagentSteps.length > 0) {
+                extraSubagentSteps += st.subagentSteps.length;
+                for (const subStep of st.subagentSteps) {
+                  if (subStep.stepType === 'MODEL_CALL') {
+                    modelCallsCount++;
+                  } else if (subStep.stepType === 'TOOL_EXECUTION' && subStep.toolName) {
+                    toolCallsCount++;
+                    toolsUsed[subStep.toolName] = (toolsUsed[subStep.toolName] || 0) + 1;
+                  }
+                }
+              }
+            }
             if (st.isSkill) skillCallsCount++;
           }
         }
@@ -570,7 +691,7 @@ export class DashboardService {
             completion: Number(t.completion_tokens),
             total: Number(t.total_tokens),
           },
-          stepCount: Number(t.step_count),
+          stepCount: turnSteps.length + extraSubagentSteps,
           summary: t.summary || null,
           metrics: {
             toolCallsCount,
@@ -583,7 +704,7 @@ export class DashboardService {
         };
       });
 
-      // Aggregate thread tool summary
+      // Aggregate thread tool summary (including tools called by subagents!)
       const toolSummaryRows = db.prepare(`
         SELECT tool_name,
                COUNT(*) as callCount,
@@ -591,10 +712,11 @@ export class DashboardService {
                AVG(duration_ms) as avgDurationMs,
                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failedCount
         FROM steps
-        WHERE thread_id = ? AND step_type = 'TOOL_EXECUTION' AND tool_name IS NOT NULL
+        WHERE (thread_id = ? OR thread_id = ? OR thread_id IN (SELECT thread_id FROM threads WHERE parent_thread_id = ? OR parent_thread_id = ?))
+          AND step_type = 'TOOL_EXECUTION' AND tool_name IS NOT NULL
         GROUP BY tool_name
         ORDER BY callCount DESC
-      `).all(threadId) as any[];
+      `).all(actualThreadId, effectiveId, actualThreadId, effectiveId) as any[];
 
       const toolSummary = toolSummaryRows.map((r) => ({
         toolName: r.tool_name,
@@ -603,6 +725,11 @@ export class DashboardService {
         avgDurationMs: Math.round(Number(r.avgDurationMs)),
         failedCount: Number(r.failedCount),
       }));
+
+      const sumTurnsDuration = turns.reduce((acc, t) => acc + t.durationMs, 0);
+      threadItem.totalTurns = turns.length;
+      threadItem.totalSteps = stepRows.length + Array.from(childStepsMap.values()).reduce((acc, s) => acc + s.length, 0);
+      threadItem.durationMs = Math.max(Number(threadRow.total_duration_ms || 0), sumTurnsDuration);
 
       return {
         thread: threadItem,
@@ -627,11 +754,86 @@ export class DashboardService {
     const db = this.openDb(dbPath);
     if (!db) return false;
     try {
-      const stmt = db.prepare('UPDATE threads SET current_state = ?, updated_at = ? WHERE thread_id = ?');
-      stmt.run(status, Date.now(), threadId);
+      const mappedId = threadId.startsWith('task_') ? threadId.replace(/^task_/, 'session_') : (threadId.startsWith('session_') ? threadId.replace(/^session_/, 'task_') : threadId);
+      const stmt = db.prepare('UPDATE threads SET current_state = ?, updated_at = ? WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ?');
+      stmt.run(status, Date.now(), threadId, threadId, mappedId, mappedId);
       return true;
     } catch (err) {
       console.error(`[DashboardService] Error updating status for ${threadId}:`, err);
+      return false;
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Deletes a single session and all associated threads, turns, steps, events, and artifacts.
+   */
+  public static deleteSession(requestedDb: string | undefined, sessionId: string): boolean {
+    const dbPath = this.resolveDbPath(requestedDb);
+    const db = this.openDb(dbPath);
+    if (!db) return false;
+    try {
+      db.exec('PRAGMA foreign_keys = OFF;');
+      const mappedId = sessionId.startsWith('task_')
+        ? sessionId.replace(/^task_/, 'session_')
+        : (sessionId.startsWith('session_') ? sessionId.replace(/^session_/, 'task_') : sessionId);
+
+      const threadRows = db.prepare(`
+        SELECT thread_id FROM threads
+        WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ? OR parent_thread_id = ? OR parent_thread_id = ?
+      `).all(sessionId, sessionId, mappedId, mappedId, sessionId, mappedId) as Array<{ thread_id: string }>;
+
+      const threadIds = Array.from(new Set([sessionId, mappedId, ...threadRows.map((r) => r.thread_id)]));
+
+      for (const tid of threadIds) {
+        db.prepare('DELETE FROM turns WHERE thread_id = ?').run(tid);
+        db.prepare('DELETE FROM steps WHERE thread_id = ?').run(tid);
+        db.prepare('DELETE FROM task_events WHERE thread_id = ?').run(tid);
+        db.prepare('DELETE FROM blackboard_entries WHERE thread_id = ?').run(tid);
+        db.prepare('DELETE FROM artifacts WHERE thread_id = ?').run(tid);
+        db.prepare('DELETE FROM threads WHERE thread_id = ?').run(tid);
+      }
+
+      try {
+        db.prepare('DELETE FROM acp_sessions WHERE session_id = ? OR session_id = ?').run(sessionId, mappedId);
+      } catch {}
+
+      db.exec('PRAGMA foreign_keys = ON;');
+      return true;
+    } catch (err) {
+      console.error(`[DashboardService] Error deleting session ${sessionId}:`, err);
+      return false;
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Clears all session, turn, and step data from a database (resets to a clean slate).
+   */
+  public static clearDatabaseHistory(requestedDb?: string): boolean {
+    const dbPath = this.resolveDbPath(requestedDb);
+    const db = this.openDb(dbPath);
+    if (!db) return false;
+    try {
+      db.exec('PRAGMA foreign_keys = OFF;');
+      db.exec('DELETE FROM turns;');
+      db.exec('DELETE FROM steps;');
+      db.exec('DELETE FROM task_events;');
+      db.exec('DELETE FROM blackboard_entries;');
+      db.exec('DELETE FROM artifacts;');
+      db.exec('DELETE FROM threads;');
+      try {
+        db.exec('DELETE FROM acp_sessions;');
+      } catch {}
+      db.exec('PRAGMA foreign_keys = ON;');
+      try {
+        db.exec('VACUUM;');
+      } catch {}
+      return true;
+    } catch (err) {
+      console.error(`[DashboardService] Error clearing history for ${dbPath}:`, err);
       return false;
     } finally {
       db.close();
@@ -681,6 +883,8 @@ export class DashboardService {
       return { success: false, sessionId, message: `Database not found: ${dbPath}` };
     }
 
+    const targetSessionId = sessionId.startsWith('task_') ? sessionId.replace(/^task_/, 'session_') : sessionId;
+
     try {
       const { createAgentRuntime } = await import('../index.js');
       const { MemoryTransport } = await import('../client/memory-transport.js');
@@ -701,26 +905,26 @@ export class DashboardService {
 
         if (options.mode === 'checkpoint' && !promptText) {
           // Checkpoint mode: resume existing task DAG
-          let thread = runtime.activeThreads.get(sessionId);
+          let thread = runtime.activeThreads.get(targetSessionId);
           if (!thread) {
-            await runtime.dispatcher.callMethod('session/load', { sessionId });
-            thread = runtime.activeThreads.get(sessionId);
+            await runtime.dispatcher.callMethod('session/load', { sessionId: targetSessionId });
+            thread = runtime.activeThreads.get(targetSessionId);
           }
           if (!thread) {
-            return { success: false, sessionId, message: `Could not load session context for ${sessionId}` };
+            return { success: false, sessionId: targetSessionId, message: `Could not load session context for ${targetSessionId}` };
           }
           const report = await runtime.runner.resumeTask(thread);
-          return { success: true, sessionId, status: report.status, message: 'Resumed from checkpoint', metrics: report };
+          return { success: true, sessionId: targetSessionId, status: report.status, message: 'Resumed from checkpoint', metrics: report };
         } else {
           // Continue dialogue mode: send follow-up prompt to session
           const promptToSend = promptText || '请从之前中断的地方继续推进并汇报最新进展。';
           const promptRes = await runtime.dispatcher.callMethod<any, any>('session/prompt', {
-            sessionId,
+            sessionId: targetSessionId,
             prompt: promptToSend,
           });
           return {
             success: promptRes.status === 'completed' || promptRes.status === 'blocked',
-            sessionId,
+            sessionId: targetSessionId,
             status: promptRes.status,
             message: promptRes.summary || 'Prompt executed',
             metrics: promptRes.metrics,

@@ -9,8 +9,8 @@ export interface DatabaseConfig {
 export class AgentDatabase {
   private readonly db: DatabaseSync;
 
-  constructor(config: DatabaseConfig = {}) {
-    const dbPath = config.dbPath || ':memory:';
+  constructor(config: DatabaseConfig | string = {}) {
+    const dbPath = typeof config === 'string' ? config : (config.dbPath || ':memory:');
     if (dbPath !== ':memory:') {
       const dir = path.dirname(dbPath);
       if (!fs.existsSync(dir)) {
@@ -146,6 +146,29 @@ export class AgentDatabase {
       // Safe schema migration for existing databases
       try {
         this.db.exec(`ALTER TABLE acp_sessions ADD COLUMN history TEXT`);
+      } catch {}
+
+      // Auto-migrate legacy task_ thread IDs to canonical session_ IDs
+      try {
+        this.db.exec('PRAGMA foreign_keys = OFF;');
+        const legacyRows = this.db.prepare(
+          "SELECT thread_id, session_id FROM threads WHERE thread_id LIKE 'task_%'"
+        ).all() as Array<{ thread_id: string; session_id: string | null }>;
+
+        for (const row of legacyRows) {
+          const targetSessionId = (row.session_id && row.session_id.startsWith('session_'))
+            ? row.session_id
+            : row.thread_id.replace(/^task_/, 'session_');
+
+          this.db.prepare('UPDATE threads SET thread_id = ?, session_id = ? WHERE thread_id = ?').run(targetSessionId, targetSessionId, row.thread_id);
+          this.db.prepare('UPDATE turns SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+          this.db.prepare('UPDATE steps SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+          this.db.prepare('UPDATE task_events SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+          this.db.prepare('UPDATE blackboard_entries SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+          this.db.prepare('UPDATE artifacts SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
+          this.db.prepare('UPDATE threads SET parent_thread_id = ? WHERE parent_thread_id = ?').run(targetSessionId, row.thread_id);
+        }
+        this.db.exec('PRAGMA foreign_keys = ON;');
       } catch {}
     }
 

@@ -108,7 +108,11 @@ export class ThreadContext {
     return this.currentState;
   }
 
-  public createTurn(turnType: TurnType, milestoneId?: string): TurnContext {
+  public createTurn(turnType: TurnType = 'USER_INPUT', milestoneId?: string): TurnContext {
+    const existingCount = this.telemetryStore.getTurnCount(this.threadId);
+    if (this.turnCounter < existingCount) {
+      this.turnCounter = existingCount;
+    }
     const turnId = `${this.threadId}_turn_${this.turnCounter++}`;
     this.currentTurn = new TurnContext(
       {

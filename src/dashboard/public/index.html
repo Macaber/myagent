@@ -120,6 +120,14 @@
         <span>离线导入</span>
         <input type="file" id="file-import" accept=".json" class="hidden" />
       </label>
+
+      <!-- Clear Database History -->
+      <button id="btn-clear-database" class="px-2.5 py-1.5 bg-zinc-800 hover:bg-red-950/60 text-zinc-400 hover:text-red-300 border border-zinc-700 hover:border-red-800/60 rounded-lg text-xs font-medium transition flex items-center space-x-1.5" title="清空当前数据库的所有历史会话和脏数据">
+        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+        </svg>
+        <span>清空历史</span>
+      </button>
     </div>
   </header>
 
@@ -266,6 +274,12 @@
               </button>
               <button id="btn-mark-suspended" class="hidden px-2.5 py-1 bg-amber-600/80 hover:bg-amber-500 border border-amber-500 rounded text-xs text-white transition flex items-center space-x-1" title="将由于终端退出未打标的历史运行中会话归档为已中断">
                 <span>🛑 标记为已中断</span>
+              </button>
+              <button id="btn-delete-session" class="px-2.5 py-1 bg-zinc-800 hover:bg-red-950/60 border border-zinc-700 hover:border-red-800/60 rounded text-xs text-zinc-400 hover:text-red-300 transition flex items-center space-x-1" title="彻底删除此会话及其所有关联数据">
+                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                <span>删除会话</span>
               </button>
               <button id="btn-copy-thread-id" class="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-xs text-zinc-300 hover:text-white transition flex items-center space-x-1">
                 <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -640,13 +654,15 @@
       else if (item.role === 'coder') roleTag = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">coder</span>`;
       else if (item.role === 'qa') roleTag = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30">qa</span>`;
 
+      const displayId = item.sessionId || item.threadId;
       el.innerHTML += `
         <div class="flex items-center justify-between text-[11px] mb-1">
-          <div class="flex items-center space-x-1.5">
+          <div class="flex items-center space-x-1.5 min-w-0">
             ${roleTag}
             <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold border ${statusColor}">${item.currentState}</span>
+            <span class="text-[10px] font-mono text-zinc-400 bg-zinc-800/80 px-1 py-0.5 rounded truncate max-w-[130px]" title="${escapeHtml(displayId)}">${escapeHtml(displayId)}</span>
           </div>
-          <span class="text-zinc-500 text-[10px]">${formatTimeAgo(item.createdAt)}</span>
+          <span class="text-zinc-500 text-[10px] shrink-0 ml-1">${formatTimeAgo(item.createdAt)}</span>
         </div>
         <div class="text-xs font-medium text-zinc-200 line-clamp-2 leading-tight mb-2">
           ${escapeHtml(item.prompt || '无 Prompt 说明')}
@@ -714,7 +730,8 @@
       detailView.classList.remove('hidden');
 
       const t = data.thread;
-      document.getElementById('detail-thread-id').textContent = t.threadId;
+      const displayId = t.sessionId || t.threadId;
+      document.getElementById('detail-thread-id').textContent = displayId;
       document.getElementById('detail-prompt').textContent = t.prompt;
       document.getElementById('detail-workspace').textContent = t.workspacePath;
       document.getElementById('detail-created-at').textContent = new Date(t.createdAt).toLocaleString();
@@ -732,11 +749,11 @@
       if (t.currentState === 'RUNNING') {
         btnMark.classList.remove('hidden');
         btnMark.onclick = async () => {
-          if (confirm(`确认将会话 ${t.threadId} 标记为 SUSPENDED (已中断) 吗？`)) {
+          if (confirm(`确认将会话 ${displayId} 标记为 SUSPENDED (已中断) 吗？`)) {
             const res = await fetch('/api/dashboard/session/set-status', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ sessionId: t.threadId, status: 'SUSPENDED', db: currentDb }),
+              body: JSON.stringify({ sessionId: displayId, status: 'SUSPENDED', db: currentDb }),
             });
             if (res.ok) {
               await refreshDashboard();
@@ -751,8 +768,9 @@
       const parentLink = document.getElementById('detail-parent-link');
       if (data.parentThread) {
         parentLink.classList.remove('hidden');
-        parentLink.textContent = `↖ 所属主任务: ${data.parentThread.threadId.substring(0, 18)}...`;
-        parentLink.onclick = () => selectThread(data.parentThread.threadId);
+        const parentId = data.parentThread.sessionId || data.parentThread.threadId;
+        parentLink.textContent = `↖ 所属主会话: ${parentId.substring(0, 18)}...`;
+        parentLink.onclick = () => selectThread(parentId);
       } else {
         parentLink.classList.add('hidden');
       }
@@ -818,7 +836,7 @@
           <!-- Turn Header -->
           <div class="turn-header p-3.5 bg-zinc-850 hover:bg-zinc-800/80 flex items-center justify-between cursor-pointer transition select-none">
             <div class="flex items-center space-x-3 flex-wrap gap-y-1">
-              <span class="font-bold text-xs text-white">Turn #${turn.turnIndex}</span>
+              <span class="font-bold text-xs text-white">Turn #${turn.turnIndex + 1}</span>
               <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-900/40 text-indigo-300 border border-indigo-700/50">${turn.turnType}</span>
               <span class="text-xs text-zinc-300 font-medium">${escapeHtml(turn.summary || 'Turn 执行轮次')}</span>
             </div>
@@ -913,6 +931,23 @@
             ${step.errorMessage ? `
               <div class="mt-2 p-2 rounded bg-red-950/50 border border-red-800/60 text-red-300 text-[11px] font-mono">
                 ❌ 错误: ${escapeHtml(step.errorMessage)}
+              </div>
+            ` : ''}
+
+            <!-- Subagent Nested Steps (Default Open) -->
+            ${step.subagentSteps && step.subagentSteps.length > 0 ? `
+              <div class="mt-2.5 pt-2 border-t border-fuchsia-900/40">
+                <details open class="group">
+                  <summary class="text-[11px] font-semibold text-fuchsia-400 hover:text-fuchsia-300 cursor-pointer select-none flex items-center justify-between">
+                    <span class="flex items-center space-x-1.5">
+                      <span>🤖 子智能体内部执行步骤 (${step.subagentSteps.length})</span>
+                    </span>
+                    <span class="text-[10px] text-zinc-500 font-mono group-open:rotate-180 transition-transform duration-200">▼</span>
+                  </summary>
+                  <div class="mt-2 pl-2 border-l-2 border-fuchsia-800/60 space-y-2">
+                    ${renderStepItems(step.subagentSteps)}
+                  </div>
+                </details>
               </div>
             ` : ''}
 
@@ -1125,7 +1160,7 @@
           alert('请先选择一个 Session 才能导出');
           return;
         }
-        downloadJson(cachedThreadDetail, `session-${cachedThreadDetail.thread.threadId}.json`);
+        downloadJson(cachedThreadDetail, `session-${cachedThreadDetail.thread.sessionId || cachedThreadDetail.thread.threadId}.json`);
       };
 
       // Export All Database
@@ -1149,6 +1184,69 @@
         }
       };
 
+      // Delete Current Session
+      const btnDeleteSession = document.getElementById('btn-delete-session');
+      if (btnDeleteSession) {
+        btnDeleteSession.onclick = async () => {
+          if (!currentThreadId) return;
+          const targetId = cachedThreadDetail?.thread?.sessionId || cachedThreadDetail?.thread?.threadId || currentThreadId;
+          if (!confirm(`确认彻底删除会话 [${targetId}] 及其所有历史轮次、步骤和产物吗？\n此操作不可逆！`)) {
+            return;
+          }
+          try {
+            const res = await fetch('/api/dashboard/session/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sessionId: targetId, db: currentDb }),
+            });
+            const result = await res.json();
+            if (res.ok && result.success) {
+              currentThreadId = null;
+              cachedThreadDetail = null;
+              document.getElementById('detail-view').classList.add('hidden');
+              document.getElementById('empty-state').classList.remove('hidden');
+              await refreshDashboard();
+              alert(`🗑 已彻底删除会话: ${targetId}`);
+            } else {
+              alert(`删除失败: ${result.error || '未知错误'}`);
+            }
+          } catch (err) {
+            alert(`删除请求失败: ${err.message}`);
+          }
+        };
+      }
+
+      // Clear Current Database History
+      const btnClearDatabase = document.getElementById('btn-clear-database');
+      if (btnClearDatabase) {
+        btnClearDatabase.onclick = async () => {
+          const dbLabel = currentDb || '默认库 data.db';
+          if (!confirm(`⚠️ 高危操作确认：\n确认清空当前数据库 [${dbLabel}] 的所有历史会话与遥测数据吗？\n清空后将从零开始记录全新会话，之前的所有脏数据将彻底清除。`)) {
+            return;
+          }
+          try {
+            const res = await fetch('/api/dashboard/database/clear', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ db: currentDb }),
+            });
+            const result = await res.json();
+            if (res.ok && result.success) {
+              currentThreadId = null;
+              cachedThreadDetail = null;
+              document.getElementById('detail-view').classList.add('hidden');
+              document.getElementById('empty-state').classList.remove('hidden');
+              await refreshDashboard();
+              alert(`🧹 已成功清空数据库 [${result.db || dbLabel}] 中的所有脏数据！`);
+            } else {
+              alert(`清空失败: ${result.error || '未知错误'}`);
+            }
+          } catch (err) {
+            alert(`清空请求失败: ${err.message}`);
+          }
+        };
+      }
+
       // Resume Session Modal Controls
       const resumeModal = document.getElementById('resume-modal');
       const btnResumeSession = document.getElementById('btn-resume-session');
@@ -1168,11 +1266,12 @@
             alert('请先在左侧选择一个会话 (Session)');
             return;
           }
-          resumeSessionIdEl.textContent = currentThreadId;
+          const targetSessionId = cachedThreadDetail?.thread?.sessionId || cachedThreadDetail?.thread?.threadId || currentThreadId;
+          resumeSessionIdEl.textContent = targetSessionId;
           const isCheckpoint = document.querySelector('input[name="resume-mode"]:checked')?.value === 'checkpoint';
           resumeCliCmdEl.textContent = isCheckpoint
-            ? `npm run task -- --resume ${currentThreadId}`
-            : `npm run tui -- --resume ${currentThreadId}`;
+            ? `npm run task -- --resume ${targetSessionId}`
+            : `npm run tui -- --resume ${targetSessionId}`;
           resumePromptInput.value = '';
           resumeModal.classList.remove('hidden');
           resumePromptInput.focus();
@@ -1188,12 +1287,13 @@
       // Mode switch
       document.querySelectorAll('input[name="resume-mode"]').forEach(r => {
         r.onchange = (e) => {
+          const targetSessionId = cachedThreadDetail?.thread?.sessionId || cachedThreadDetail?.thread?.threadId || currentThreadId || 'session_xxx';
           if (e.target.value === 'checkpoint') {
             resumePromptInput.placeholder = '（可选）针对性断点重试提示词，留空则直接执行重试剩余里程碑...';
-            resumeCliCmdEl.textContent = `npm run task -- --resume ${currentThreadId || 'session_xxx'}`;
+            resumeCliCmdEl.textContent = `npm run task -- --resume ${targetSessionId}`;
           } else {
             resumePromptInput.placeholder = '例如：请继续编写剩余的测试用例并验证...';
-            resumeCliCmdEl.textContent = `npm run tui -- --resume ${currentThreadId || 'session_xxx'}`;
+            resumeCliCmdEl.textContent = `npm run tui -- --resume ${targetSessionId}`;
           }
         };
       });
@@ -1210,6 +1310,7 @@
       if (btnSubmitResume) {
         btnSubmitResume.onclick = async () => {
           if (!currentThreadId) return;
+          const targetSessionId = cachedThreadDetail?.thread?.sessionId || cachedThreadDetail?.thread?.threadId || currentThreadId;
           const mode = document.querySelector('input[name="resume-mode"]:checked')?.value || 'continue';
           const prompt = resumePromptInput.value.trim();
 
@@ -1222,7 +1323,7 @@
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                sessionId: currentThreadId,
+                sessionId: targetSessionId,
                 prompt,
                 mode,
                 db: currentDb,

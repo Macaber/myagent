@@ -1051,13 +1051,14 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   // =========================================================================
 
   dispatcher.registerMethod<TaskStartParams, TaskStartResult>('task/start', async (params) => {
-    const threadId = params.taskId || `task_${Date.now()}`;
+    const sessionId = params.taskId || `session_${Date.now()}`;
+    const threadId = sessionId;
     const workspace = params.workspacePath ? path.resolve(params.workspacePath) : root;
 
     const thread = new ThreadContext(
       {
         threadId,
-        sessionId: `session_${Date.now()}`,
+        sessionId,
         prompt: params.prompt,
         workspacePath: workspace,
       },

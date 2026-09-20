@@ -184,5 +184,57 @@ export function handleDashboardHttpRequest(
     return true;
   }
 
+  // POST /api/dashboard/session/delete & POST /api/dashboard/thread/delete
+  if (req.method === 'POST' && (pathname === '/api/dashboard/session/delete' || pathname === '/api/dashboard/thread/delete')) {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const id = payload.sessionId || payload.threadId;
+        const db = payload.db || requestedDb;
+
+        if (!id) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'sessionId is required' }));
+          return;
+        }
+
+        const success = DashboardService.deleteSession(db, id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success, sessionId: id, threadId: id }));
+      } catch (err: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return true;
+  }
+
+  // POST /api/dashboard/database/clear
+  if (req.method === 'POST' && pathname === '/api/dashboard/database/clear') {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const db = payload.db || requestedDb;
+        const success = DashboardService.clearDatabaseHistory(db);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success, db: db || 'data.db' }));
+      } catch (err: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return true;
+  }
+
   return false;
 }

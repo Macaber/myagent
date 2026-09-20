@@ -152,9 +152,11 @@ export class TelemetryStore {
     const rawDb = this.db.getRawDb();
     const now = Date.now();
 
-    // Compute total duration from created_at
+    // Compute total duration from turns duration sum or from created_at
+    const sumRow = rawDb.prepare('SELECT SUM(duration_ms) as s FROM turns WHERE thread_id = ?').get(threadId) as any;
+    const turnsDuration = Number(sumRow?.s || 0);
     const thread = rawDb.prepare('SELECT created_at FROM threads WHERE thread_id = ?').get(threadId) as any;
-    const duration = thread ? now - Number(thread.created_at) : 0;
+    const duration = turnsDuration > 0 ? turnsDuration : (thread ? now - Number(thread.created_at) : 0);
 
     const stmt = rawDb.prepare(`
       UPDATE threads
@@ -192,12 +194,14 @@ export class TelemetryStore {
       now
     );
 
-    // Increment thread's turn count and set current_turn_id
+    // Sync thread's turn count and set current_turn_id
+    const countRow = rawDb.prepare('SELECT COUNT(*) as c FROM turns WHERE thread_id = ?').get(params.threadId) as any;
+    const actualTurns = Number(countRow?.c || 0);
     rawDb.prepare(`
       UPDATE threads
-      SET total_turns = total_turns + 1, current_turn_id = ?, updated_at = ?
+      SET total_turns = ?, current_turn_id = ?, updated_at = ?
       WHERE thread_id = ?
-    `).run(params.turnId, now, params.threadId);
+    `).run(actualTurns, params.turnId, now, params.threadId);
   }
 
   public recordTurnEnd(params: {
@@ -253,6 +257,12 @@ export class TelemetryStore {
     // Increment turn's step count and thread's total_steps
     rawDb.prepare('UPDATE turns SET step_count = step_count + 1 WHERE turn_id = ?').run(params.turnId);
     rawDb.prepare('UPDATE threads SET total_steps = total_steps + 1, updated_at = ? WHERE thread_id = ?').run(now, params.threadId);
+
+    // If thread is a subagent (has parent_thread_id), also increment parent thread's total_steps
+    const parentRow = rawDb.prepare('SELECT parent_thread_id FROM threads WHERE thread_id = ?').get(params.threadId) as any;
+    if (parentRow?.parent_thread_id) {
+      rawDb.prepare('UPDATE threads SET total_steps = total_steps + 1, updated_at = ? WHERE thread_id = ?').run(now, parentRow.parent_thread_id);
+    }
   }
 
   public recordStepEnd(params: {
@@ -311,6 +321,19 @@ export class TelemetryStore {
             updated_at = ?
         WHERE thread_id = ?
       `).run(pTokens, cTokens, tTokens, now, step.thread_id);
+
+      // Also accumulate to parent thread if this is a subagent
+      const parentRow = rawDb.prepare('SELECT parent_thread_id FROM threads WHERE thread_id = ?').get(step.thread_id) as any;
+      if (parentRow?.parent_thread_id) {
+        rawDb.prepare(`
+          UPDATE threads
+          SET total_prompt_tokens = total_prompt_tokens + ?,
+              total_completion_tokens = total_completion_tokens + ?,
+              total_tokens = total_tokens + ?,
+              updated_at = ?
+          WHERE thread_id = ?
+        `).run(pTokens, cTokens, tTokens, now, parentRow.parent_thread_id);
+      }
     }
   }
 
@@ -354,7 +377,7 @@ export class TelemetryStore {
       summary: r.summary || undefined,
     }));
 
-    // 3. Tool metrics
+    // 3. Tool metrics (including subagents)
     const toolRows = rawDb.prepare(`
       SELECT tool_name as toolName,
              COUNT(*) as callCount,
@@ -362,10 +385,11 @@ export class TelemetryStore {
              AVG(duration_ms) as avgDurationMs,
              SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failedCount
       FROM steps
-      WHERE thread_id = ? AND step_type = 'TOOL_EXECUTION' AND tool_name IS NOT NULL
+      WHERE (thread_id = ? OR thread_id IN (SELECT thread_id FROM threads WHERE parent_thread_id = ?))
+        AND step_type = 'TOOL_EXECUTION' AND tool_name IS NOT NULL
       GROUP BY tool_name
       ORDER BY callCount DESC
-    `).all(threadId) as any[];
+    `).all(threadId, threadId) as any[];
 
     const toolMetrics: ToolMetricItem[] = toolRows.map((r) => ({
       toolName: r.toolName,
@@ -375,15 +399,15 @@ export class TelemetryStore {
       failedCount: Number(r.failedCount),
     }));
 
-    // 4. Step type distribution
+    // 4. Step type distribution (including subagents)
     const stepTypeRows = rawDb.prepare(`
       SELECT step_type as stepType,
              COUNT(*) as occurrences,
              SUM(duration_ms) as totalDurationMs
       FROM steps
-      WHERE thread_id = ?
+      WHERE (thread_id = ? OR thread_id IN (SELECT thread_id FROM threads WHERE parent_thread_id = ?))
       GROUP BY step_type
-    `).all(threadId) as any[];
+    `).all(threadId, threadId) as any[];
 
     const stepTypeDistribution: StepTypeDistributionItem[] = stepTypeRows.map((r) => {
       const duration = Number(r.totalDurationMs);
@@ -396,18 +420,29 @@ export class TelemetryStore {
       };
     });
 
-    // 5. Aggregate counts
-    const modelCallsCount = (rawDb.prepare(
-      "SELECT COUNT(*) as c FROM steps WHERE thread_id = ? AND step_type = 'MODEL_CALL'"
-    ).get(threadId) as any)?.c ?? 0;
+    // 5. Aggregate counts (including subagents)
+    const modelCallsCount = (rawDb.prepare(`
+      SELECT COUNT(*) as c FROM steps
+      WHERE (thread_id = ? OR thread_id IN (SELECT thread_id FROM threads WHERE parent_thread_id = ?))
+        AND step_type = 'MODEL_CALL'
+    `).get(threadId, threadId) as any)?.c ?? 0;
 
-    const toolCallsCount = (rawDb.prepare(
-      "SELECT COUNT(*) as c FROM steps WHERE thread_id = ? AND step_type = 'TOOL_EXECUTION'"
-    ).get(threadId) as any)?.c ?? 0;
+    const toolCallsCount = (rawDb.prepare(`
+      SELECT COUNT(*) as c FROM steps
+      WHERE (thread_id = ? OR thread_id IN (SELECT thread_id FROM threads WHERE parent_thread_id = ?))
+        AND step_type = 'TOOL_EXECUTION'
+    `).get(threadId, threadId) as any)?.c ?? 0;
 
-    const approvalsCount = (rawDb.prepare(
-      "SELECT COUNT(*) as c FROM steps WHERE thread_id = ? AND step_type = 'APPROVAL_WAIT'"
-    ).get(threadId) as any)?.c ?? 0;
+    const approvalsCount = (rawDb.prepare(`
+      SELECT COUNT(*) as c FROM steps
+      WHERE (thread_id = ? OR thread_id IN (SELECT thread_id FROM threads WHERE parent_thread_id = ?))
+        AND step_type = 'APPROVAL_WAIT'
+    `).get(threadId, threadId) as any)?.c ?? 0;
+
+    const totalStepsCount = (rawDb.prepare(`
+      SELECT COUNT(*) as c FROM steps
+      WHERE (thread_id = ? OR thread_id IN (SELECT thread_id FROM threads WHERE parent_thread_id = ?))
+    `).get(threadId, threadId) as any)?.c ?? Number(thread.total_steps);
 
     return {
       threadId,
@@ -420,8 +455,8 @@ export class TelemetryStore {
         totalTokens: Number(thread.total_tokens),
       },
       counts: {
-        turns: Number(thread.total_turns),
-        steps: Number(thread.total_steps),
+        turns: turnsBreakdown.length,
+        steps: Number(totalStepsCount),
         toolCalls: Number(toolCallsCount),
         modelCalls: Number(modelCallsCount),
         approvals: Number(approvalsCount),

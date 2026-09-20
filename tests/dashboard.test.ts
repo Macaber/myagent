@@ -165,4 +165,47 @@ describe('Agent Telemetry Dashboard & HTTP API', () => {
       await transport.close();
     }
   });
+
+  test('8. DashboardService.deleteSession and HTTP /api/dashboard/session/delete removes session cascade', async () => {
+    const tmpDbPath = `/tmp/test-dashboard-delete-${Date.now()}.db`;
+    const db = new AgentDatabase(tmpDbPath);
+    const raw = db.getRawDb();
+    raw.prepare("INSERT INTO threads (thread_id, session_id, current_state, prompt, workspace_path, created_at, updated_at) VALUES ('del_session_1', 'del_session_1', 'COMPLETED', 'To be deleted', '/tmp', ?, ?)").run(Date.now(), Date.now());
+    raw.prepare("INSERT INTO turns (turn_id, thread_id, turn_index, turn_type, status, started_at) VALUES ('turn_del_1', 'del_session_1', 0, 'WORKER', 'COMPLETED', ?)").run(Date.now());
+    raw.prepare("INSERT INTO steps (step_id, turn_id, thread_id, step_index, step_type, status, started_at) VALUES ('step_del_1', 'turn_del_1', 'del_session_1', 0, 'MODEL_CALL', 'SUCCESS', ?)").run(Date.now());
+    db.close();
+
+    const delRes = await fetch(`http://127.0.0.1:${serverPort}/api/dashboard/session/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'del_session_1', db: tmpDbPath }),
+    });
+    assert.strictEqual(delRes.status, 200);
+    const delJson = await delRes.json();
+    assert.strictEqual(delJson.success, true);
+
+    const checkList = DashboardService.getSessionList(tmpDbPath);
+    assert.strictEqual(checkList.length, 0, 'Session should be completely removed');
+  });
+
+  test('9. DashboardService.clearDatabaseHistory and HTTP /api/dashboard/database/clear wipes dirty history', async () => {
+    const tmpDbPath = `/tmp/test-dashboard-clear-${Date.now()}.db`;
+    const db = new AgentDatabase(tmpDbPath);
+    const raw = db.getRawDb();
+    raw.prepare("INSERT INTO threads (thread_id, session_id, current_state, prompt, workspace_path, created_at, updated_at) VALUES ('s1', 's1', 'COMPLETED', 'Dirty 1', '/tmp', ?, ?)").run(Date.now(), Date.now());
+    raw.prepare("INSERT INTO threads (thread_id, session_id, current_state, prompt, workspace_path, created_at, updated_at) VALUES ('s2', 's2', 'COMPLETED', 'Dirty 2', '/tmp', ?, ?)").run(Date.now(), Date.now());
+    db.close();
+
+    const clearRes = await fetch(`http://127.0.0.1:${serverPort}/api/dashboard/database/clear`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ db: tmpDbPath }),
+    });
+    assert.strictEqual(clearRes.status, 200);
+    const clearJson = await clearRes.json();
+    assert.strictEqual(clearJson.success, true);
+
+    const summary = DashboardService.getDashboardSummary(tmpDbPath);
+    assert.strictEqual(summary.totalThreads, 0, 'Database history should be 0');
+  });
 });

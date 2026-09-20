@@ -59,7 +59,8 @@ describe('TaskRunner End-to-End Execution', () => {
 
     assert.strictEqual(report.threadId, threadId);
     assert.strictEqual(report.status, 'COMPLETED');
-    assert.ok(report.counts.turns >= 4, 'Should execute Planning + 3 Worker turns + Summary');
+    assert.strictEqual(report.counts.turns, 1, 'Should execute 1 prompt turn for the task');
+    assert.ok(report.counts.steps >= 3, 'Should execute Planning and Worker milestone steps');
     assert.ok(report.totalDurationMs >= 0);
 
     // Check that summary file was generated

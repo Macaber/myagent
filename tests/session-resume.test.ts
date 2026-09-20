@@ -7,6 +7,7 @@ import { createAgentRuntime } from '../dist/index.js';
 import { AcpClient } from '../dist/client/acp-client.js';
 import { createMemoryTransportPair } from '../dist/client/memory-transport.js';
 import { DashboardService } from '../dist/dashboard/dashboard-service.js';
+import { AgentDatabase } from '../dist/persistence/db.js';
 
 describe('Session Concept & Multi-Turn Conversation Resumption', () => {
   let tmpDir: string;
@@ -187,5 +188,69 @@ describe('Session Concept & Multi-Turn Conversation Resumption', () => {
     assert.strictEqual(synthesized[1].content.text, '旧任务执行总结完成');
 
     runtime.close();
+  });
+
+  test('7. Auto-migrates legacy task_ IDs to session_ IDs in AgentDatabase and DashboardService', () => {
+    const legacyDbPath = path.join(tmpDir, 'legacy-task.db');
+    const legacyDb = new AgentDatabase(legacyDbPath);
+    const rawDb = legacyDb.getRawDb();
+
+    // Insert legacy task_ thread with turns and child steps
+    const legacyTaskId = 'task_1789870355106';
+    const canonicalSessionId = 'session_1789870355106';
+    rawDb.prepare(`
+      INSERT INTO threads (
+        thread_id, session_id, current_state, prompt, workspace_path, created_at, updated_at
+      ) VALUES (?, ?, 'COMPLETED', '历史评测任务', '/tmp', ?, ?)
+    `).run(legacyTaskId, canonicalSessionId, Date.now() - 50000, Date.now() - 10000);
+
+    rawDb.prepare(`
+      INSERT INTO turns (
+        turn_id, thread_id, turn_index, turn_type, status, started_at, summary
+      ) VALUES (?, ?, 0, 'WORKER', 'COMPLETED', ?, '历史总结')
+    `).run(`turn_0`, legacyTaskId, Date.now() - 40000);
+
+    rawDb.prepare(`
+      INSERT INTO steps (
+        step_id, turn_id, thread_id, step_index, step_type, status, started_at
+      ) VALUES (?, ?, ?, 0, 'MODEL_CALL', 'SUCCESS', ?)
+    `).run('step_0', 'turn_0', legacyTaskId, Date.now() - 30000);
+
+    legacyDb.close();
+
+    // Reopen database - initSchema triggers auto-migration
+    const reopenedDb = new AgentDatabase(legacyDbPath);
+    const reopenedRaw = reopenedDb.getRawDb();
+
+    // Check threads table
+    const legacyCheck = reopenedRaw.prepare('SELECT * FROM threads WHERE thread_id = ?').get(legacyTaskId);
+    assert.strictEqual(legacyCheck, undefined, 'Old task_ thread_id should have been migrated');
+
+    const migratedRow = reopenedRaw.prepare('SELECT * FROM threads WHERE thread_id = ?').get(canonicalSessionId) as any;
+    assert.ok(migratedRow, 'Thread should now have canonical session_id as thread_id');
+    assert.strictEqual(migratedRow.session_id, canonicalSessionId);
+
+    // Check turns & steps foreign keys
+    const turnsCheck = reopenedRaw.prepare('SELECT * FROM turns WHERE thread_id = ?').all(canonicalSessionId);
+    assert.strictEqual(turnsCheck.length, 1, 'Turns should reference new session_id');
+
+    const stepsCheck = reopenedRaw.prepare('SELECT * FROM steps WHERE thread_id = ?').all(canonicalSessionId);
+    assert.strictEqual(stepsCheck.length, 1, 'Steps should reference new session_id');
+
+    // Check DashboardService
+    const sessions = DashboardService.getSessionList(legacyDbPath);
+    assert.strictEqual(sessions[0].sessionId, canonicalSessionId);
+    assert.strictEqual(sessions[0].threadId, canonicalSessionId);
+
+    const detail = DashboardService.getSessionDetail(legacyDbPath, canonicalSessionId);
+    assert.ok(detail);
+    assert.strictEqual(detail.thread.sessionId, canonicalSessionId);
+    assert.strictEqual(detail.turns.length, 1);
+
+    // Also verify querying by legacy task_ id still resolves via dual query
+    const dualDetail = DashboardService.getSessionDetail(legacyDbPath, legacyTaskId);
+    assert.ok(dualDetail, 'Should still resolve if queried with legacy task_ id');
+
+    reopenedDb.close();
   });
 });

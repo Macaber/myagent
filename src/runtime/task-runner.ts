@@ -25,41 +25,41 @@ export class TaskRunner {
   ): Promise<ThreadMetricsReport> {
     const stateMachine = new TaskStateMachine(threadContext.getState() as any);
 
-    // 1. Planning Phase (if no plan exists yet)
+    // 1. Create a single Turn for this user interaction / prompt
+    const promptTurn = threadContext.createTurn('USER_INPUT');
+
+    // 2. Planning Phase (if no plan exists yet)
     let plan = threadContext.getExecutionPlan();
     if (!plan) {
       stateMachine.transitionTo('PLANNING');
       threadContext.setState('PLANNING');
 
-      const planningTurn = threadContext.createTurn('PLANNING');
       try {
-        plan = await this.planner.createPlan(threadContext.prompt, planningTurn, {
+        plan = await this.planner.createPlan(threadContext.prompt, promptTurn, {
           threadId: threadContext.threadId,
-          turnId: planningTurn.turnId,
+          turnId: promptTurn.turnId,
           workspaceJail: threadContext.workspaceJail,
           blackboard: threadContext.blackboard,
           abortSignal: options.abortSignal,
         });
 
         threadContext.setExecutionPlan(plan);
-        planningTurn.end({
-          status: 'COMPLETED',
-          summary: `Decomposed goal into ${plan.getMilestones().length} milestones`,
-        });
       } catch (err: any) {
-        planningTurn.end({ status: 'FAILED', summary: err.message });
+        promptTurn.end({ status: 'FAILED', summary: err.message });
         stateMachine.transitionTo('FAILED');
         return threadContext.fail(`Planning phase failed: ${err.message}`);
       }
     }
 
-    // 2. Execution Loop
+    // 3. Execution Loop (all milestones execute within the prompt turn)
     stateMachine.transitionTo('RUNNING');
     threadContext.setState('RUNNING');
 
     let turnsCount = 0;
+    let lastSummary = '';
     while (!plan.isAllCompleted()) {
       if (options.abortSignal?.aborted) {
+        promptTurn.end({ status: 'FAILED', summary: 'Task cancelled by user' });
         stateMachine.transitionTo('CANCELLED');
         threadContext.setState('CANCELLED');
         return threadContext.fail('Task cancelled by user');
@@ -67,15 +67,19 @@ export class TaskRunner {
 
       turnsCount++;
       if (turnsCount > (this.config.maxTurns || 50)) {
+        promptTurn.end({ status: 'FAILED', summary: `Max turn limit exceeded (${this.config.maxTurns})` });
         stateMachine.transitionTo('FAILED');
         return threadContext.fail(`Max turn limit exceeded (${this.config.maxTurns})`);
       }
 
       const readyMilestones = plan.getReadyMilestones();
       if (readyMilestones.length === 0) {
-        // If no ready milestones and not all completed, check if any failed or blocked
         const blocked = plan.getFailedMilestones();
         if (blocked.length > 0) {
+          promptTurn.end({
+            status: 'FAILED',
+            summary: `Task execution blocked: Milestones [${blocked.map((b) => b.id).join(', ')}] failed or require user intervention`,
+          });
           stateMachine.transitionTo('FAILED');
           return threadContext.fail(
             `Task execution blocked: Milestones [${blocked.map((b) => b.id).join(', ')}] failed or require user intervention`
@@ -84,18 +88,17 @@ export class TaskRunner {
         break;
       }
 
-      // Execute next milestone in worker turn
+      // Execute next milestone within this turn
       const currentMilestone = readyMilestones[0];
       currentMilestone.status = 'RUNNING';
 
-      const workerTurn = threadContext.createTurn('WORKER', currentMilestone.id);
       const workerResult = await this.worker.executeMilestone(
         currentMilestone,
-        workerTurn,
+        promptTurn,
         {
           threadId: threadContext.threadId,
           prompt: threadContext.prompt,
-          turnId: workerTurn.turnId,
+          turnId: promptTurn.turnId,
           workspaceJail: threadContext.workspaceJail,
           blackboard: threadContext.blackboard,
           abortSignal: options.abortSignal,
@@ -103,16 +106,15 @@ export class TaskRunner {
         options.userHint
       );
 
+      if (workerResult.summary) {
+        lastSummary = workerResult.summary;
+      }
+
       if (workerResult.status === 'SUCCESS') {
         plan.markMilestoneStatus(currentMilestone.id, 'SUCCESS', workerResult.summary);
-        workerTurn.end({
-          status: 'COMPLETED',
-          summary: workerResult.summary,
-        });
       } else if (workerResult.status === 'BLOCKED') {
-        // Blocked / Fast-fail: Alert user immediately and halt without blind retry
         plan.markMilestoneStatus(currentMilestone.id, 'BLOCKED', workerResult.summary, workerResult.error);
-        workerTurn.end({
+        promptTurn.end({
           status: 'FAILED',
           summary: `Milestone blocked: ${workerResult.error || workerResult.summary}`,
         });
@@ -122,7 +124,7 @@ export class TaskRunner {
 
         threadContext.dispatcher?.emitTaskEvent({
           threadId: threadContext.threadId,
-          turnId: workerTurn.turnId,
+          turnId: promptTurn.turnId,
           type: 'BLOCKED_NEED_USER',
           timestamp: Date.now(),
           data: {
@@ -134,9 +136,8 @@ export class TaskRunner {
 
         return threadContext.telemetryStore.getThreadMetrics(threadContext.threadId);
       } else {
-        // Failed
         plan.markMilestoneStatus(currentMilestone.id, 'FAILED', workerResult.summary, workerResult.error);
-        workerTurn.end({
+        promptTurn.end({
           status: 'FAILED',
           summary: workerResult.error || 'Execution failed',
         });
@@ -145,10 +146,14 @@ export class TaskRunner {
       }
     }
 
-    // 3. Summary Phase
-    const summaryTurn = threadContext.createTurn('SUMMARY');
-    const finalReport = threadContext.complete('All milestones in DAG completed successfully.');
-    summaryTurn.end({ status: 'COMPLETED', summary: 'Generated final metrics and artifact summary' });
+    // 4. Summary & Completion
+    const finalSummary = lastSummary || 'All milestones in DAG completed successfully.';
+    promptTurn.end({
+      status: 'COMPLETED',
+      summary: finalSummary,
+    });
+
+    const finalReport = threadContext.complete(finalSummary);
 
     // Save summary artifact
     ArtifactManager.saveRunSummary(
