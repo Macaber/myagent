@@ -68,6 +68,7 @@ export class AgentDatabase {
         total_tokens INTEGER DEFAULT 0,
         step_count INTEGER DEFAULT 0,
         summary TEXT,
+        user_prompt TEXT,
         FOREIGN KEY(thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns(thread_id, turn_index);
@@ -146,6 +147,9 @@ export class AgentDatabase {
       // Safe schema migration for existing databases
       try {
         this.db.exec(`ALTER TABLE acp_sessions ADD COLUMN history TEXT`);
+      } catch {}
+      try {
+        this.db.exec(`ALTER TABLE turns ADD COLUMN user_prompt TEXT`);
       } catch {}
 
       // Auto-migrate legacy task_ thread IDs to canonical session_ IDs

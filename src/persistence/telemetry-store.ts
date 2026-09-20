@@ -175,6 +175,7 @@ export class TelemetryStore {
     turnIndex: number;
     turnType: TurnType;
     milestoneId?: string;
+    userPrompt?: string;
   }): void {
     const rawDb = this.db.getRawDb();
     const now = Date.now();
@@ -182,8 +183,8 @@ export class TelemetryStore {
       INSERT INTO turns (
         turn_id, thread_id, turn_index, turn_type, milestone_id,
         status, started_at, duration_ms, prompt_tokens,
-        completion_tokens, total_tokens, step_count
-      ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, 0, 0, 0)
+        completion_tokens, total_tokens, step_count, user_prompt
+      ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, 0, 0, 0, 0, 0, ?)
     `);
     stmt.run(
       params.turnId,
@@ -191,7 +192,8 @@ export class TelemetryStore {
       params.turnIndex,
       params.turnType,
       params.milestoneId ?? null,
-      now
+      now,
+      params.userPrompt ?? null
     );
 
     // Sync thread's turn count and set current_turn_id

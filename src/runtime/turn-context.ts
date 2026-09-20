@@ -9,6 +9,7 @@ export interface TurnContextConfig {
   turnIndex: number;
   turnType: TurnType;
   milestoneId?: string;
+  userPrompt?: string;
 }
 
 export class TurnContext {
@@ -17,6 +18,7 @@ export class TurnContext {
   public readonly turnIndex: number;
   public readonly turnType: TurnType;
   public readonly milestoneId?: string;
+  public readonly userPrompt?: string;
   public readonly startedAt: number;
 
   private stepCounter = 0;
@@ -35,6 +37,7 @@ export class TurnContext {
     this.turnIndex = config.turnIndex;
     this.turnType = config.turnType;
     this.milestoneId = config.milestoneId;
+    this.userPrompt = config.userPrompt;
     this.startedAt = Date.now();
 
     // 1. Record Turn Start in Telemetry
@@ -44,6 +47,7 @@ export class TurnContext {
       turnIndex: this.turnIndex,
       turnType: this.turnType,
       milestoneId: this.milestoneId,
+      userPrompt: this.userPrompt,
     });
 
     // 2. Append event to EventStore

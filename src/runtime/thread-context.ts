@@ -108,7 +108,7 @@ export class ThreadContext {
     return this.currentState;
   }
 
-  public createTurn(turnType: TurnType = 'USER_INPUT', milestoneId?: string): TurnContext {
+  public createTurn(turnType: TurnType = 'USER_INPUT', milestoneId?: string, userPrompt?: string): TurnContext {
     const existingCount = this.telemetryStore.getTurnCount(this.threadId);
     if (this.turnCounter < existingCount) {
       this.turnCounter = existingCount;
@@ -121,6 +121,7 @@ export class ThreadContext {
         turnIndex: this.turnCounter - 1,
         turnType,
         milestoneId,
+        userPrompt: userPrompt ?? (turnType === 'USER_INPUT' ? this.prompt : undefined),
       },
       this.telemetryStore,
       this.eventStore,

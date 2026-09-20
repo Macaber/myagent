@@ -96,6 +96,7 @@ export interface TurnDetail {
   };
   stepCount: number;
   summary: string | null;
+  userPrompt?: string;
   metrics: {
     toolCallsCount: number;
     subagentCallsCount: number;
@@ -693,6 +694,7 @@ export class DashboardService {
           },
           stepCount: turnSteps.length + extraSubagentSteps,
           summary: t.summary || null,
+          userPrompt: t.user_prompt || undefined,
           metrics: {
             toolCallsCount,
             subagentCallsCount,

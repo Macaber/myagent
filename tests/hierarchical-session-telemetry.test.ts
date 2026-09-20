@@ -16,6 +16,7 @@ import { WorkerAgent } from '../dist/engine/worker.js';
 import { SubagentManager } from '../dist/runtime/subagent-manager.js';
 import { createInvokeSubagentTool } from '../dist/tools/subagent-tool.js';
 import { readTool, writeTool } from '../dist/tools/core-tools.js';
+import { isConversationalGoal } from '../dist/engine/planner.js';
 
 describe('Hierarchical Session-Turn-Step Telemetry & Subagent Rollup', () => {
   let testDir: string;
@@ -72,7 +73,9 @@ describe('Hierarchical Session-Turn-Step Telemetry & Subagent Rollup', () => {
     assert.strictEqual(detail.thread.totalTurns, 2, 'Thread detail totalTurns must be strictly 2 for 2 prompts');
     assert.strictEqual(detail.turns.length, 2, 'Waterfall turns length must be strictly 2');
     assert.strictEqual(detail.turns[0].turnIndex, 0, 'Turn 1 raw index must be 0');
+    assert.strictEqual(detail.turns[0].userPrompt, '你好', 'Turn 1 should preserve userPrompt');
     assert.strictEqual(detail.turns[1].turnIndex, 1, 'Turn 2 raw index must be 1');
+    assert.strictEqual(detail.turns[1].userPrompt, '你好再次', 'Turn 2 should preserve userPrompt');
     assert.ok(detail.thread.totalSteps >= 2, 'totalSteps must count steps across turns');
     assert.ok(detail.thread.durationMs >= 0, 'durationMs should not be 0 or null');
 
@@ -174,5 +177,25 @@ describe('Hierarchical Session-Turn-Step Telemetry & Subagent Rollup', () => {
     assert.strictEqual(detail.subagentsSummary[0].role, 'Research Specialist');
 
     db.close();
+  });
+
+  test('isConversationalGoal correctly identifies capability questions and greetings without triggering tool execution', () => {
+    // Capability questions (should all bypass tools and DAG decomposition)
+    assert.strictEqual(isConversationalGoal('你会做什么？'), true);
+    assert.strictEqual(isConversationalGoal('你会做什么'), true);
+    assert.strictEqual(isConversationalGoal('你能做什么？'), true);
+    assert.strictEqual(isConversationalGoal('你会干什么'), true);
+    assert.strictEqual(isConversationalGoal('你能干啥'), true);
+    assert.strictEqual(isConversationalGoal('你有什么功能'), true);
+    assert.strictEqual(isConversationalGoal('你支持哪些功能'), true);
+    assert.strictEqual(isConversationalGoal('what can you do?'), true);
+    assert.strictEqual(isConversationalGoal('介绍一下你自己'), true);
+    assert.strictEqual(isConversationalGoal('你好！'), true);
+
+    // Actual task actions should NOT be conversational (must run full ReAct loop)
+    assert.strictEqual(isConversationalGoal('帮我写一个测试脚本'), false);
+    assert.strictEqual(isConversationalGoal('修改 package.json 添加依赖'), false);
+    assert.strictEqual(isConversationalGoal('查代码里有没有 eval'), false);
+    assert.strictEqual(isConversationalGoal('build and test the project'), false);
   });
 });

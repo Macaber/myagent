@@ -13,21 +13,41 @@ export interface PlannerConfig {
 export function isConversationalGoal(goal: string): boolean {
   if (!goal) return false;
   const trimmed = goal.trim().toLowerCase();
+  const clean = trimmed.replace(/[!！?？,，.~。\s]/g, '');
 
   const exactMatches = new Set([
     '你好', '您好', '嗨', '哈喽', '哈罗', '早', '早上好', '下午好', '晚上好',
+    '在吗', '在不在', '有人吗',
     'hello', 'hi', 'hey', 'greetings', 'howdy', 'good morning', 'good afternoon', 'good evening',
     '你是谁', '你是谁？', 'who are you', 'who are you?',
-    '你能做什么', '你能做什么？', '你能帮我做什么', 'what can you do', 'what can you do?',
-    '介绍一下你自己', '介绍下你自己', '自我介绍', 'introduce yourself',
+    '你能做什么', '你能做什么？', '你会做什么', '你会做什么？',
+    '你能干什么', '你能干什么？', '你会干什么', '你会干什么？',
+    '你能干啥', '你能干啥？', '你会干啥', '你会干啥？',
+    '你能帮我做什么', '你会帮我做什么', '你能帮我干嘛', '你能提供什么帮助',
+    '你有什么功能', '你有哪些功能', '你的功能是什么', '功能介绍', '能力介绍',
+    '你有什么能力', '你有哪些能力', '你擅长什么', '你有什么用', '你可以做什么', '你可以帮我做什么',
+    'what can you do', 'what can you do?', 'what do you do', 'what do you do?',
+    'what are your capabilities', 'what are your features', 'how can you help', 'how can you help me',
+    'tell me about yourself',
+    '介绍一下你自己', '介绍下你自己', '自我介绍', '介绍自己', 'introduce yourself',
     '帮助', 'help', 'hi there', 'hello there', '谢谢', '多谢', '感谢', 'thanks', 'thank you',
     'ok', '好的', '收到', '明白'
   ]);
 
-  if (exactMatches.has(trimmed)) return true;
+  if (exactMatches.has(trimmed) || exactMatches.has(clean)) return true;
 
-  const clean = trimmed.replace(/[!！?？,，.~。\s]/g, '');
-  if (exactMatches.has(clean)) return true;
+  // Generalized capability questions (e.g. "你都会些什么呢", "你支持哪些功能", "你能帮我做点什么")
+  const isCapabilityQuestion =
+    /^(你|您)?(会|能|可以|能够|支持|具备)?(做|干|搞|帮我做|帮我干|实现)?(什么|啥|哪些)(功能|能力|事情|活|操作)?$/i.test(clean) ||
+    /^(你|您)?(有什么|有哪些|具备哪些)(功能|能力|特性|用处|技能|本领)$/i.test(clean) ||
+    /^(功能|能力|技能|特性)(列表|介绍|说明)$/i.test(clean);
+
+  if (isCapabilityQuestion) {
+    // Avoid matching actual task commands that contain action verbs
+    if (!/(写|改|修|建|删|查代码|测|实现|run|build|create|write|delete|edit|fix|test|make|search|grep)/i.test(trimmed)) {
+      return true;
+    }
+  }
 
   // Short greetings like "你好呀", "嗨~", "hello agent" (up to 15 chars)
   if (/^(你好|您好|哈喽|hello|hi|hey)[\s\S]{0,12}$/i.test(trimmed)) {

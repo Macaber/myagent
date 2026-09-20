@@ -835,12 +835,18 @@
         turnCard.innerHTML = `
           <!-- Turn Header -->
           <div class="turn-header p-3.5 bg-zinc-850 hover:bg-zinc-800/80 flex items-center justify-between cursor-pointer transition select-none">
-            <div class="flex items-center space-x-3 flex-wrap gap-y-1">
-              <span class="font-bold text-xs text-white">Turn #${turn.turnIndex + 1}</span>
-              <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-900/40 text-indigo-300 border border-indigo-700/50">${turn.turnType}</span>
-              <span class="text-xs text-zinc-300 font-medium">${escapeHtml(turn.summary || 'Turn 执行轮次')}</span>
+            <div class="flex items-center space-x-3 flex-wrap gap-y-1 min-w-0 flex-1 mr-4">
+              <span class="font-bold text-xs text-white shrink-0">Turn #${turn.turnIndex + 1}</span>
+              <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-900/40 text-indigo-300 border border-indigo-700/50 shrink-0">${turn.turnType}</span>
+              ${turn.userPrompt ? `
+                <span class="text-xs text-amber-300/90 font-medium truncate max-w-[450px]" title="${escapeHtml(turn.userPrompt)}">
+                  👤 提问: "${escapeHtml(turn.userPrompt)}"
+                </span>
+              ` : `
+                <span class="text-xs text-zinc-400 font-medium truncate max-w-[450px]">${escapeHtml(turn.summary ? (turn.summary.length > 50 ? turn.summary.slice(0, 50) + '...' : turn.summary) : 'Turn 执行轮次')}</span>
+              `}
             </div>
-            <div class="flex items-center space-x-3 text-xs text-zinc-400 font-mono">
+            <div class="flex items-center space-x-3 text-xs text-zinc-400 font-mono shrink-0">
               <span class="text-amber-300 font-semibold">${formatNumber(turn.tokens.total)} tk</span>
               <span>⏱ ${formatDuration(turn.durationMs)}</span>
               <span>🐾 ${turn.stepCount} steps</span>
@@ -859,6 +865,16 @@
 
           <!-- Turn Steps Drawer (Default Expanded) -->
           <div class="turn-steps-body p-3 bg-zinc-950/90 border-t border-zinc-800 space-y-2">
+            ${turn.summary ? `
+              <div class="p-3 bg-zinc-900/90 rounded-lg border border-zinc-800/80 text-xs mb-2">
+                <div class="text-[11px] font-semibold text-emerald-400 mb-1.5 flex items-center space-x-1.5">
+                  <span>💬 智能体最终回复 / 产出总结:</span>
+                </div>
+                <div class="whitespace-pre-wrap leading-relaxed text-zinc-300 text-[11px] font-sans bg-zinc-950/70 p-2.5 rounded border border-zinc-800/60 max-h-96 overflow-y-auto code-scroll">
+                  ${escapeHtml(turn.summary)}
+                </div>
+              </div>
+            ` : ''}
             ${renderStepItems(turn.steps)}
           </div>
         `;
