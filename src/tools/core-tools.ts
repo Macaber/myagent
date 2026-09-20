@@ -30,6 +30,13 @@ export const bashTool: AgentTool<{ command: string; cwd?: string; timeoutMs?: nu
         cwd: effectiveCwd,
         timeout,
         maxBuffer: 10 * 1024 * 1024,
+        env: {
+          ...process.env,
+          CI: 'true',
+          DEBIAN_FRONTEND: 'noninteractive',
+          npm_config_yes: 'true',
+          PAGER: 'cat',
+        },
       });
       const combined = [
         stdout.trim().length > 0 ? `STDOUT:\n${stdout}` : '',

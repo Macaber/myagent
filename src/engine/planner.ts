@@ -1,3 +1,5 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { OpenAIProvider } from '../provider/openai-provider.js';
 import { ChatMessage } from '../provider/types.js';
 import { ExecutionPlan, Milestone } from './dag.js';
@@ -96,7 +98,8 @@ PLANNING RULES:
 3. Only for complex multi-step feature implementations, major refactorings, or tasks explicitly requiring full test suite execution: Decompose into 2-3 logical milestones (e.g. implement, verify).
 4. ACCEPTANCE CRITERIA FORMATTING:
    - For file creation or verification: Use format "file_exists: <path>" (e.g. "file_exists: hello.txt") or describe the condition in plain text. NEVER use "cmd: cat ..." to verify files!
-   - For test/build execution: Use "cmd: <command>" where <command> MUST be ONLY a valid shell command (e.g. "cmd: npm test"). NEVER append natural language comments, Chinese explanations, or expected output to the "cmd:" line.
+   - For test/build execution: Use "cmd: <command>" where <command> MUST match the project's actual scripts (e.g. "cmd: npm test"). NEVER hallucinate uninstalled test runners (like vitest or jest) if not present in project scripts!
+   - For reporting or query tasks: State acceptance criteria in plain text (e.g. "Test results reported").
 5. Workers must prefer safe built-in tools (read, write, edit, glob, grep). Do NOT instruct workers to run shell commands (like cat, od, wc) for inspecting files when read/glob tools can do it.
 
 Output ONLY valid JSON matching this schema:
@@ -114,9 +117,20 @@ Output ONLY valid JSON matching this schema:
   ]
 }`;
 
+        let userPromptContent = `Goal: ${goal}\nProject Root: ${toolContext.workspaceJail.getWorkspaceRoot()}`;
+        try {
+          const pkgPath = path.join(toolContext.workspaceJail.getWorkspaceRoot(), 'package.json');
+          if (fs.existsSync(pkgPath)) {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            if (pkg.scripts) {
+              userPromptContent += `\nProject package.json scripts: ${JSON.stringify(pkg.scripts)}`;
+            }
+          }
+        } catch {}
+
         const messages: ChatMessage[] = [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Goal: ${goal}\nProject Root: ${toolContext.workspaceJail.getWorkspaceRoot()}` },
+          { role: 'user', content: userPromptContent },
         ];
 
         const response = await this.provider.complete({
