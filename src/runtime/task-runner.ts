@@ -2,6 +2,7 @@ import { ThreadContext } from './thread-context.js';
 import { TaskStateMachine } from './state-machine.js';
 import { Planner } from '../engine/planner.js';
 import { WorkerAgent } from '../engine/worker.js';
+import { DirectAgentLoop } from '../engine/direct-agent-loop.js';
 import { BreakpointResumer } from './breakpoint-resumer.js';
 import { ArtifactManager } from './artifacts.js';
 import { ThreadMetricsReport } from '../persistence/telemetry-store.js';
@@ -28,8 +29,69 @@ export class TaskRunner {
     // 1. Create a single Turn for this user interaction / prompt
     const promptTurn = threadContext.createTurn('USER_INPUT');
 
-    // 2. Planning Phase (if no plan exists yet)
+    // 2. Planning Phase vs Direct Agent Loop
     let plan = threadContext.getExecutionPlan();
+
+    // If an LLM provider is present and no pre-existing DAG plan was set, use unified DirectAgentLoop
+    if (!plan && this.worker.provider) {
+      stateMachine.transitionTo('RUNNING');
+      threadContext.setState('RUNNING');
+
+      const directLoop = new DirectAgentLoop(
+        this.worker.provider,
+        this.toolRegistry,
+        this.worker.toolRouter,
+        this.worker.skillRegistry,
+        this.worker.contextAssembler
+      );
+
+      const loopResult = await directLoop.run({
+        threadContext,
+        turnContext: promptTurn,
+        toolContext: {
+          threadId: threadContext.threadId,
+          prompt: threadContext.prompt,
+          workspaceJail: threadContext.workspaceJail,
+          blackboard: threadContext.blackboard,
+          abortSignal: options.abortSignal,
+        },
+        userHint: options.userHint,
+        steeringQueue: threadContext.steeringQueue,
+        abortSignal: options.abortSignal,
+      });
+
+      if (loopResult.status === 'CANCELLED') {
+        promptTurn.end({ status: 'FAILED', summary: 'Task cancelled by user' });
+        stateMachine.transitionTo('CANCELLED');
+        threadContext.setState('CANCELLED');
+        return threadContext.fail('Task cancelled by user');
+      }
+
+      if (loopResult.status === 'FAILED') {
+        promptTurn.end({ status: 'FAILED', summary: loopResult.error || 'Execution failed' });
+        stateMachine.transitionTo('FAILED');
+        return threadContext.fail(loopResult.error || 'Execution failed');
+      }
+
+      promptTurn.end({
+        status: 'COMPLETED',
+        summary: loopResult.summary,
+      });
+
+      stateMachine.transitionTo('COMPLETED');
+      threadContext.setState('COMPLETED');
+
+      const finalReport = threadContext.complete(loopResult.summary);
+      ArtifactManager.saveRunSummary(
+        threadContext.workspaceJail.getWorkspaceRoot(),
+        threadContext.threadId,
+        finalReport,
+        threadContext.blackboard
+      );
+      return finalReport;
+    }
+
+    // Otherwise (offline testing mode or explicit DAG plan), use Milestone DAG execution
     if (!plan) {
       stateMachine.transitionTo('PLANNING');
       threadContext.setState('PLANNING');

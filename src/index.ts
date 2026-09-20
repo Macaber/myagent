@@ -28,6 +28,7 @@ import {
   questionTool,
   patchTool,
 } from './tools/extended-tools.js';
+import { planTaskTool } from './tools/plan-tool.js';
 import { SkillRegistry } from './skills/skill-registry.js';
 import { McpManager } from './mcp/mcp-manager.js';
 import { McpServerConfig } from './mcp/types.js';
@@ -322,6 +323,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // Register Extended Tools (websearch and webfetch deleted)
   toolRegistry.registerTool(todoWriteTool);
+  toolRegistry.registerTool(planTaskTool);
   toolRegistry.registerTool(skillTool);
   toolRegistry.registerTool(questionTool);
   toolRegistry.registerTool(patchTool);
@@ -828,6 +830,25 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
         });
       }
     } else {
+      if (session.thread.getState() === 'RUNNING') {
+        session.thread.pushSteering(promptText);
+        const userChunk: SessionUpdate = {
+          sessionUpdate: 'user_message_chunk',
+          content: { type: 'text', text: promptText },
+        };
+        session.history.push(userChunk);
+        dispatcher.emitSessionUpdate({
+          sessionId: params.sessionId,
+          update: userChunk,
+        });
+        return {
+          sessionId: params.sessionId,
+          stopReason: 'steering_queued',
+          status: 'running',
+          summary: 'Steering directive queued for active turn',
+          content: [{ type: 'text', text: promptText }],
+        } as any;
+      }
       session.thread.setPrompt(promptText);
       session.updatedAt = new Date().toISOString();
     }

@@ -6,6 +6,7 @@ import { WorkspaceJail } from '../security/workspace-jail.js';
 import { RpcDispatcher } from '../protocol/rpc-dispatcher.js';
 import { ExecutionPlan } from '../engine/dag.js';
 import { TurnContext } from './turn-context.js';
+import { UserMessage } from '../engine/agent-message.js';
 
 export interface ThreadContextConfig {
   threadId: string;
@@ -24,11 +25,21 @@ export class ThreadContext {
   public readonly blackboard: Blackboard;
   public readonly telemetryStore: TelemetryStore;
   public readonly eventStore: EventStore;
+  public readonly steeringQueue: UserMessage[] = [];
 
   private turnCounter = 0;
   private currentTurn?: TurnContext;
   private executionPlan?: ExecutionPlan;
   private currentState = 'PENDING';
+
+  public pushSteering(content: string): void {
+    this.steeringQueue.push({
+      role: 'user',
+      content,
+      isSteering: true,
+      timestamp: Date.now(),
+    });
+  }
 
   constructor(
     config: ThreadContextConfig,

@@ -22,9 +22,9 @@ export class WorkerAgent {
   public readonly contextAssembler: DynamicContextAssembler;
 
   constructor(
-    private readonly provider: OpenAIProvider | undefined,
+    public readonly provider: OpenAIProvider | undefined,
     private readonly toolRegistry: ToolRegistry,
-    private readonly skillRegistry: SkillRegistry,
+    public readonly skillRegistry: SkillRegistry,
     private readonly verificationGuard: VerificationGuard,
     toolRouter?: ToolRouter,
     contextAssembler?: DynamicContextAssembler
