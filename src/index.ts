@@ -198,6 +198,13 @@ export interface AgentRuntimeOptions {
   autoDiscoverProvider?: boolean;
   autoScanSkills?: boolean;
   autoLoadMcp?: boolean;
+  /**
+   * When true, privileged RPC methods (session/*, task/*, mcp/*, skills/reload)
+   * require a prior successful `authenticate` call. Default false for
+   * local stdio use; enable for network-exposed HTTP deployments
+   * (or set MYAGENT_REQUIRE_AUTH=true).
+   */
+  requireAuth?: boolean;
 }
 
 export function extractPromptText(raw: any): string {
@@ -367,6 +374,35 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   let clientCapabilities: ClientCapabilities = {};
   let clientInfo: ClientInfo | null | undefined = undefined;
   let authenticated: boolean = false;
+  const requireAuth = options.requireAuth ?? process.env.MYAGENT_REQUIRE_AUTH === 'true';
+  const PUBLIC_METHODS = new Set(['initialize', 'authenticate', 'logout']);
+  const assertAuthenticated = (method: string) => {
+    if (requireAuth && !authenticated && !PUBLIC_METHODS.has(method)) {
+      throw { code: ACP_ERROR_CODES.AUTH_REQUIRED, message: `Authentication required for '${method}'` };
+    }
+  };
+
+  // MCP env blocklist: never allow clients to override loader-critical vars (RCE surface)
+  const BLOCKED_MCP_ENV = new Set([
+    'PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
+    'DYLD_LIBRARY_PATH', 'NODE_OPTIONS', 'NODE_PATH', 'PYTHONPATH',
+  ]);
+  const sanitizeMcpEnv = (env: Record<string, string> | undefined): Record<string, string> | undefined => {
+    if (!env) return undefined;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(env)) {
+      if (BLOCKED_MCP_ENV.has(k.toUpperCase())) continue;
+      out[k] = v;
+    }
+    return out;
+  };
+  // Normalize a requested session cwd. Sessions are logical contexts — the cwd
+  // may be a filter key or a dir created later — so only normalize here.
+  // Containment is enforced per-thread by WorkspaceJail; remote deployments
+  // should additionally enable requireAuth (MYAGENT_REQUIRE_AUTH=true).
+  const resolveSessionCwd = (requested: string | undefined): string => {
+    return path.resolve(requested || root);
+  };
 
   // Register Subagent Manager & Tool
   const subagentManager = new SubagentManager(db, worker, toolRegistry, skillRegistry, dispatcher);
@@ -414,12 +450,15 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
     if (!params || !params.methodId) {
       throw { code: ACP_ERROR_CODES.INVALID_PARAMS, message: 'Missing methodId' };
     }
-    if (params.data?.token || params.data?.apiKey) {
-      const apiKey = params.data.token || params.data.apiKey;
+    const apiKey = params.data?.token || params.data?.apiKey;
+    if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.trim().length < 8)) {
+      throw { code: ACP_ERROR_CODES.INVALID_PARAMS, message: 'Invalid token: must be a non-empty API key' };
+    }
+    if (apiKey) {
       provider = new OpenAIProvider({
         apiKey,
-        baseUrl: params.data.baseUrl,
-        model: params.data.model,
+        baseUrl: params.data?.baseUrl,
+        model: params.data?.model,
       });
     }
     authenticated = true;
@@ -436,9 +475,19 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/new
   dispatcher.registerMethod<NewSessionRequest, NewSessionResponse>('session/new', async (params) => {
+    assertAuthenticated('session/new');
     const sessionId = (params as any)?.sessionId || `session_${Date.now()}_${nextSessionSeq++}`;
-    const cwd = params?.cwd || (params as any)?.workspacePath || ((params as any)?.roots && (params as any)?.roots[0]) || root;
-    const additionalDirectories = params?.additionalDirectories || [];
+    const cwd = resolveSessionCwd(
+      params?.cwd || (params as any)?.workspacePath || ((params as any)?.roots && (params as any)?.roots[0])
+    );
+    const additionalDirectories = (params?.additionalDirectories || []).filter((d: string) => {
+      try {
+        return fs.statSync(path.resolve(d)).isDirectory();
+      } catch {
+        console.warn(`[MyAgent] Ignoring non-existent additionalDirectory '${d}'`);
+        return false;
+      }
+    });
     const mcpServers = params?.mcpServers || [];
 
     // Mount MCP servers if provided in params
@@ -451,7 +500,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             transport: 'stdio',
             command: server.command,
             args: server.args,
-            env: toEnvRecord(server.env),
+            env: sanitizeMcpEnv(toEnvRecord(server.env)),
           }).catch(() => {});
         }
       }
@@ -525,6 +574,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/load
   dispatcher.registerMethod<LoadSessionRequest, LoadSessionResponse>('session/load', async (params) => {
+    assertAuthenticated('session/load');
     let session = sessions.get(params.sessionId);
     if (!session) {
       const fromDb = db.getAcpSession(params.sessionId);
@@ -572,7 +622,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
       throw err;
     }
 
-    if (params.cwd) session.cwd = path.resolve(params.cwd);
+    if (params.cwd) session.cwd = resolveSessionCwd(params.cwd);
     if (params.additionalDirectories) session.additionalDirectories = params.additionalDirectories;
     if (params.mcpServers) {
       session.mcpServers = params.mcpServers;
@@ -584,7 +634,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             transport: 'stdio',
             command: server.command,
             args: server.args,
-            env: toEnvRecord(server.env),
+            env: sanitizeMcpEnv(toEnvRecord(server.env)),
           }).catch(() => {});
         }
       }
@@ -637,6 +687,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/resume
   dispatcher.registerMethod<ResumeSessionRequest, ResumeSessionResponse>('session/resume', async (params) => {
+    assertAuthenticated('session/resume');
     let session = sessions.get(params.sessionId);
     if (!session) {
       const fromDb = db.getAcpSession(params.sessionId);
@@ -684,7 +735,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
       throw err;
     }
 
-    if (params.cwd) session.cwd = path.resolve(params.cwd);
+    if (params.cwd) session.cwd = resolveSessionCwd(params.cwd);
     if (params.additionalDirectories) session.additionalDirectories = params.additionalDirectories;
     if (params.mcpServers) {
       session.mcpServers = params.mcpServers;
@@ -696,7 +747,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
             transport: 'stdio',
             command: server.command,
             args: server.args,
-            env: toEnvRecord(server.env),
+            env: sanitizeMcpEnv(toEnvRecord(server.env)),
           }).catch(() => {});
         }
       }
@@ -714,6 +765,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/list
   dispatcher.registerMethod<ListSessionsRequest, ListSessionsResponse>('session/list', async (params) => {
+    assertAuthenticated('session/list');
     const cwdFilter = params?.cwd ? path.resolve(params.cwd) : undefined;
     const result = db.listAcpSessions(cwdFilter, 50, params?.cursor || undefined);
     return {
@@ -724,6 +776,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/close
   dispatcher.registerMethod<CloseSessionRequest, CloseSessionResponse>('session/close', async (params) => {
+    assertAuthenticated('session/close');
     const controller = sessionAbortControllers.get(params.sessionId);
     if (controller) {
       controller.abort();
@@ -739,6 +792,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/delete
   dispatcher.registerMethod<DeleteSessionRequest, DeleteSessionResponse>('session/delete', async (params) => {
+    assertAuthenticated('session/delete');
     const controller = sessionAbortControllers.get(params.sessionId);
     if (controller) {
       controller.abort();
@@ -756,6 +810,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/prompt
   dispatcher.registerMethod<PromptRequest, PromptResponse>('session/prompt', async (params) => {
+    assertAuthenticated('session/prompt');
     const rawPrompt = (params as any)?.prompt ?? (params as any)?.content;
     const promptText = extractPromptText(rawPrompt);
 
@@ -967,6 +1022,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
 
   // ACP: session/set_mode
   dispatcher.registerMethod<SetSessionModeRequest, SetSessionModeResponse>('session/set_mode', async (params) => {
+    assertAuthenticated('session/set_mode');
     const session = sessions.get(params.sessionId);
     if (!session) {
       const err: any = new Error(`Session '${params.sessionId}' not found`);
@@ -1011,6 +1067,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   dispatcher.registerMethod<SetSessionConfigOptionRequest, SetSessionConfigOptionResponse>(
     'session/set_config_option',
     async (params) => {
+      assertAuthenticated('session/set_config_option');
       const session = sessions.get(params.sessionId);
       if (!session) {
         const err: any = new Error(`Session '${params.sessionId}' not found`);
@@ -1072,9 +1129,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   // =========================================================================
 
   dispatcher.registerMethod<TaskStartParams, TaskStartResult>('task/start', async (params) => {
+    assertAuthenticated('task/start');
     const sessionId = params.taskId || `session_${Date.now()}`;
     const threadId = sessionId;
-    const workspace = params.workspacePath ? path.resolve(params.workspacePath) : root;
+    const workspace = params.workspacePath ? resolveSessionCwd(params.workspacePath) : root;
 
     const thread = new ThreadContext(
       {
@@ -1104,6 +1162,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   });
 
   dispatcher.registerMethod<TaskResumeParams, TaskResumeResult>('task/resume', async (params) => {
+    assertAuthenticated('task/resume');
     const thread = activeThreads.get(params.threadId);
     if (!thread) {
       throw new Error(`Thread '${params.threadId}' not found in active threads`);
@@ -1128,6 +1187,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   });
 
   dispatcher.registerMethod<{ threadId: string }, any>('task/status', async (params) => {
+    assertAuthenticated('task/status');
     const thread = activeThreads.get(params.threadId);
     if (!thread) {
       throw new Error(`Thread '${params.threadId}' not found`);
@@ -1140,24 +1200,37 @@ export function createAgentRuntime(options: AgentRuntimeOptions = {}) {
   // =========================================================================
 
   dispatcher.registerMethod<McpServerConfig, any>('mcp/mount', async (params) => {
-    return mcpManager.mountServer(params);
+    assertAuthenticated('mcp/mount');
+    const clean = { ...params, env: sanitizeMcpEnv((params as any).env) };
+    return mcpManager.mountServer(clean);
   });
 
   dispatcher.registerMethod<{ id: string }, any>('mcp/unmount', async (params) => {
+    assertAuthenticated('mcp/unmount');
     const success = await mcpManager.unmountServer(params.id);
     return { id: params.id, success };
   });
 
   dispatcher.registerMethod<void, any>('mcp/list', async () => {
+    assertAuthenticated('mcp/list');
     return { servers: mcpManager.listMountedServers() };
   });
 
   dispatcher.registerMethod<void, any>('skills/list', async () => {
+    assertAuthenticated('skills/list');
     return { skills: skillRegistry.listSkills() };
   });
 
   dispatcher.registerMethod<{ path?: string }, any>('skills/reload', async (params) => {
+    assertAuthenticated('skills/reload');
     const dir = params?.path || path.join(root, '.agent', 'skills');
+    // Constrain reloads to the workspace to block arbitrary directory skill loading
+    try {
+      const jail = new WorkspaceJail(root);
+      jail.resolvePath(path.relative(root, path.resolve(dir)) || '.');
+    } catch (err: any) {
+      throw { code: ACP_ERROR_CODES.PERMISSION_DENIED, message: `skills/reload path escapes workspace: ${err.message}` };
+    }
     const loaded = await skillRegistry.loadSkillsFromDirectory(dir);
     return { reloadedCount: loaded.length, skills: skillRegistry.listSkills().map((s) => s.id) };
   });

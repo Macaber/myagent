@@ -12,6 +12,8 @@ export class OpenAIProvider {
   private baseUrl: string;
   private model: string;
   private fallbackModel?: string;
+  private defaultTemperature: number;
+  private defaultMaxTokens?: number;
   private maxRetries: number;
 
   constructor(config: ProviderConfig = {}) {
@@ -19,6 +21,8 @@ export class OpenAIProvider {
     this.baseUrl = (config.baseUrl || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
     this.model = config.model || process.env.OPENAI_MODEL || 'gpt-4o';
     this.fallbackModel = config.fallbackModel;
+    this.defaultTemperature = config.temperature ?? (process.env.OPENAI_TEMPERATURE ? Number(process.env.OPENAI_TEMPERATURE) : 0.2);
+    this.defaultMaxTokens = config.maxTokens ?? (process.env.OPENAI_MAX_TOKENS ? Number(process.env.OPENAI_MAX_TOKENS) : undefined);
     this.maxRetries = config.maxRetries ?? 3;
   }
 
@@ -80,6 +84,7 @@ export class OpenAIProvider {
     messages: ChatMessage[];
     tools?: ToolSchema[];
     temperature?: number;
+    maxTokens?: number;
     abortSignal?: AbortSignal;
     modelOverride?: string;
   }): AsyncGenerator<StreamDeltaChunk> {
@@ -97,6 +102,17 @@ export class OpenAIProvider {
         if (params.abortSignal?.aborted) {
           throw new Error('Chat completion request was aborted');
         }
+        if (!this.apiKey) {
+          throw new Error('Missing OPENAI_API_KEY: configure API key before calling provider');
+        }
+
+        // Combine caller abort with a 120s fetch timeout so hung gateways can't hang a turn
+        const timeoutSignal = (AbortSignal as any).timeout
+          ? (AbortSignal as any).timeout(120000)
+          : undefined;
+        const combinedSignal = params.abortSignal && timeoutSignal && (AbortSignal as any).any
+          ? (AbortSignal as any).any([params.abortSignal, timeoutSignal])
+          : (params.abortSignal ?? timeoutSignal);
 
         try {
           const body: Record<string, any> = {
@@ -104,8 +120,12 @@ export class OpenAIProvider {
             messages: sanitizedMessages,
             stream: true,
             stream_options: { include_usage: true },
-            temperature: params.temperature ?? 0.2,
+            temperature: params.temperature ?? this.defaultTemperature,
           };
+          const maxTokens = params.maxTokens ?? this.defaultMaxTokens;
+          if (maxTokens !== undefined && maxTokens > 0) {
+            body.max_tokens = Math.floor(maxTokens);
+          }
 
           if (params.tools && params.tools.length > 0) {
             body.tools = params.tools;
@@ -118,7 +138,7 @@ export class OpenAIProvider {
               'Authorization': `Bearer ${this.apiKey}`,
             },
             body: JSON.stringify(body),
-            signal: params.abortSignal,
+            signal: combinedSignal,
           });
 
           if (!response.ok) {
@@ -128,7 +148,19 @@ export class OpenAIProvider {
             const isRetryable = status === 429 || (status >= 500 && status <= 504);
 
             if (isRetryable && attempt < this.maxRetries) {
-              const backoffMs = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 10000);
+              // Honor Retry-After on 429 when present
+              let backoffMs = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 10000);
+              if (status === 429) {
+                try {
+                  const retryAfter = response.headers?.get?.('retry-after');
+                  if (retryAfter) {
+                    const secs = Number(retryAfter);
+                    if (!isNaN(secs) && secs > 0 && secs < 120) {
+                      backoffMs = secs * 1000 + Math.random() * 500;
+                    }
+                  }
+                } catch {}
+              }
               console.warn(`[OpenAIProvider] Attempt ${attempt + 1} failed with status ${status}. Retrying in ${Math.round(backoffMs)}ms...`);
               await new Promise((r) => setTimeout(r, backoffMs));
               continue;
@@ -149,9 +181,16 @@ export class OpenAIProvider {
           if (err.name === 'AbortError' || params.abortSignal?.aborted) {
             throw new Error('Chat completion request was aborted');
           }
-          if (attempt < this.maxRetries) {
-            const backoffMs = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 8000);
+          // Only retry retryable failures: 429/5xx, timeouts, connection resets.
+          // 400/401/403/404/422 are permanent — fail fast without burning retries.
+          const msg = String(err?.message || '');
+          const isPermanent = /\[(400|401|403|404|422)\]/.test(msg)
+            || /Missing OPENAI_API_KEY/.test(msg);
+          if (!isPermanent && attempt < this.maxRetries) {
+            const backoffMs = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 500, 10000);
             await new Promise((r) => setTimeout(r, backoffMs));
+          } else if (isPermanent) {
+            break;
           }
         }
       }
@@ -165,6 +204,7 @@ export class OpenAIProvider {
     messages: ChatMessage[];
     tools?: ToolSchema[];
     temperature?: number;
+    maxTokens?: number;
     abortSignal?: AbortSignal;
     modelOverride?: string;
   }): Promise<CompletionResult> {

@@ -1,5 +1,5 @@
 import { OpenAIProvider } from '../provider/openai-provider.js';
-import { ChatMessage, CompletionResult, ToolCallItem, CompletionUsage } from '../provider/types.js';
+import { ChatMessage, CompletionResult } from '../provider/types.js';
 import { ToolRegistry, ToolExecutionContext } from '../tools/tool-registry.js';
 import { SkillRegistry } from '../skills/skill-registry.js';
 import { TurnContext } from '../runtime/turn-context.js';
@@ -9,6 +9,13 @@ import { ErrorClassifier } from './error-classifier.js';
 import { VerificationGuard } from './verification-guard.js';
 import { ToolRouter } from './tool-router.js';
 import { DynamicContextAssembler } from '../context/dynamic-context-assembler.js';
+import {
+  aggregateStream,
+  parseToolCalls,
+  reportParseErrors,
+  runToolCalls,
+  createElicitationBridge,
+} from './agent-loop-core.js';
 
 export interface WorkerExecutionResult {
   status: 'SUCCESS' | 'FAILED' | 'BLOCKED';
@@ -61,6 +68,9 @@ export class WorkerAgent {
     const loopDetector = new LoopDetector(maxStepsPerTurn, 2, maxModelIterations);
     let forcedAnswerAttempt = false;
     let consecutiveVerificationFailures = 0;
+
+    // ACP elicitation bridge for the `question` tool (true blocking when connected)
+    const requestElicitation = createElicitationBridge(turnContext);
 
     // If no LLM provider (offline/mock mode), perform direct mock execution
     if (!this.provider) {
@@ -179,66 +189,33 @@ export class WorkerAgent {
             abortSignal: toolContext.abortSignal,
           });
 
-          let fullContent = '';
-          const toolCallsMap = new Map<number, { id: string; name: string; args: string }>();
-          let usage: CompletionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-
-          for await (const chunk of stream) {
-            if (chunk.type === 'thought' && chunk.thoughtText) {
-              turnContext.dispatcher?.emitSessionUpdate({
-                sessionId: toolContext.threadId,
-                updateType: 'agent_thought_chunk',
-                sessionUpdate: 'agent_thought_chunk',
-                content: { type: 'text', text: chunk.thoughtText },
-                update: {
-                  sessionUpdate: 'agent_thought_chunk',
-                  content: { type: 'text', text: chunk.thoughtText },
-                },
-                data: { text: chunk.thoughtText },
-                timestamp: Date.now(),
-              });
-            } else if (chunk.type === 'content' && chunk.deltaText) {
-              fullContent += chunk.deltaText;
-              turnContext.dispatcher?.emitSessionUpdate({
-                sessionId: toolContext.threadId,
-                updateType: 'agent_message_chunk',
-                sessionUpdate: 'agent_message_chunk',
-                content: { type: 'text', text: chunk.deltaText },
-                update: {
-                  sessionUpdate: 'agent_message_chunk',
-                  content: { type: 'text', text: chunk.deltaText },
-                },
-                data: { text: chunk.deltaText },
-                timestamp: Date.now(),
-              });
-            } else if (chunk.type === 'tool_call_delta' && chunk.toolCallDelta) {
-              const { index, id, name, argumentsChunk } = chunk.toolCallDelta;
-              const current = toolCallsMap.get(index) ?? { id: '', name: '', args: '' };
-              if (id) current.id = id;
-              if (name) current.name = name;
-              if (argumentsChunk) current.args += argumentsChunk;
-              toolCallsMap.set(index, current);
-            } else if (chunk.type === 'usage' && chunk.usage) {
-              usage = chunk.usage;
-            }
-          }
-
-          const toolCalls: ToolCallItem[] = Array.from(toolCallsMap.entries())
-            .sort(([a], [b]) => a - b)
-            .map(([_, val]) => ({
-              id: val.id || `call_${Date.now()}`,
-              type: 'function',
-              function: {
-                name: val.name,
-                arguments: val.args,
+          const emitChunk = (
+            updateType: 'agent_thought_chunk' | 'agent_message_chunk',
+            text: string
+          ) => {
+            turnContext.dispatcher?.emitSessionUpdate({
+              sessionId: toolContext.threadId,
+              updateType,
+              sessionUpdate: updateType,
+              content: { type: 'text', text },
+              update: {
+                sessionUpdate: updateType,
+                content: { type: 'text', text },
               },
-            }));
-
-          response = {
-            content: fullContent.length > 0 ? fullContent : null,
-            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-            usage,
+              data: { text },
+              timestamp: Date.now(),
+            });
           };
+
+          // Shared kernel: fold SSE deltas (content/thought/tool_calls/usage)
+          response = await aggregateStream(
+            stream,
+            {
+              onThought: (t) => emitChunk('agent_thought_chunk', t),
+              onContent: (t) => emitChunk('agent_message_chunk', t),
+            },
+            undefined
+          );
 
           if (response.usage) {
             toolContext.blackboard.recordTokenUsage(response.usage.totalTokens);
@@ -269,96 +246,41 @@ export class WorkerAgent {
           tool_calls: response.toolCalls,
         });
 
-        // 3. Check if Model wants to call Tools
+        // 3. Check if Model wants to call Tools (shared AgentLoopCore kernel)
         if (response.toolCalls && response.toolCalls.length > 0) {
-          for (const tc of response.toolCalls) {
-            const toolName = tc.function.name;
-            let parsedArgs = {};
-            try {
-              parsedArgs = JSON.parse(tc.function.arguments || '{}');
-            } catch {
-              parsedArgs = {};
+          const { executable, parseErrors } = parseToolCalls(response.toolCalls);
+          const runCtx = {
+            toolRegistry: this.toolRegistry,
+            turnContext,
+            toolContext,
+            loopDetector,
+            requestElicitation,
+          };
+          for (const msg of reportParseErrors(runCtx, parseErrors)) {
+            localTurnMessages.push(msg);
+          }
+          if (executable.length === 0) continue;
+
+          const executed = await runToolCalls(runCtx, executable);
+          let fatalReturn: WorkerExecutionResult | undefined;
+          for (const e of executed) {
+            if (e.fatalError && !fatalReturn) {
+              fatalReturn = {
+                status: 'BLOCKED',
+                summary: `Fatal tool failure in ${e.toolName}: ${e.fatalError}`,
+                error: e.fatalError,
+                remedySuggestion: e.fatalRemedy,
+              };
             }
-
-            const toolCallId = tc.id || `call_${Date.now()}`;
-
-            // Emit tool_call start update for Zed UI
-            turnContext.dispatcher?.emitSessionUpdate({
-              sessionId: toolContext.threadId,
-              updateType: 'tool_call',
-              sessionUpdate: 'tool_call',
-              update: {
-                sessionUpdate: 'tool_call',
-                toolCallId,
-                title: toolName,
-                kind: toolName === 'read' || toolName === 'grep' || toolName === 'glob' ? 'read' : toolName === 'edit' || toolName === 'write' ? 'edit' : toolName === 'bash' ? 'execute' : 'other',
-                status: 'in_progress',
-                rawInput: parsedArgs,
-              },
-              timestamp: Date.now(),
-            });
-
-            // Step: Tool Execution
-            const toolStep = turnContext.createStep({
-              stepType: 'TOOL_EXECUTION',
-              toolName,
-              metadata: { args: parsedArgs },
-            });
-
-            const executionResult = await this.toolRegistry.executeTool(
-              toolName,
-              parsedArgs,
-              {
-                ...toolContext,
-                turnId: turnContext.turnId,
-                stepId: toolStep.stepId,
-              }
-            );
-
-            const hasError = !!executionResult.error;
-            loopDetector.recordAction(toolName, parsedArgs, hasError);
-
-            // Emit tool_call_update for Zed UI
-            const toolOutputText = executionResult.output || executionResult.error || '';
-            turnContext.dispatcher?.emitSessionUpdate({
-              sessionId: toolContext.threadId,
-              updateType: 'tool_call_update',
-              sessionUpdate: 'tool_call_update',
-              update: {
-                sessionUpdate: 'tool_call_update',
-                toolCallId,
-                status: hasError ? 'failed' : 'completed',
-                content: [{ type: 'content', content: { type: 'text', text: toolOutputText.slice(0, 2000) } }],
-                rawOutput: toolOutputText,
-              },
-              timestamp: Date.now(),
-            });
-
-            toolStep.end({
-              status: hasError ? 'FAILED' : 'SUCCESS',
-              errorMessage: executionResult.error,
-            });
-
-            // Check if tool error is Fatal
-            if (hasError) {
-              const classified = ErrorClassifier.classify(executionResult.error!);
-              if (classified.severity === 'FATAL') {
-                return {
-                  status: 'BLOCKED',
-                  summary: `Fatal tool failure in ${toolName}: ${executionResult.error}`,
-                  error: executionResult.error,
-                  remedySuggestion: classified.remedySuggestion,
-                };
-              }
-            }
-
-            // Push tool response into messages
             localTurnMessages.push({
               role: 'tool',
-              tool_call_id: tc.id,
-              content: executionResult.output,
+              tool_call_id: e.toolCallId,
+              content: e.hasError
+                ? `Tool '${e.toolName}' failed: ${e.error}${e.output && e.output !== e.error ? `\nOutput: ${e.output.slice(0, 2000)}` : ''}`
+                : e.output,
             });
           }
+          if (fatalReturn) return fatalReturn;
         } else {
           // 4. Model produced final answer without tool calls -> Verify Acceptance
           milestone.resultSummary = response.content || 'Completed';

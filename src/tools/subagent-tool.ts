@@ -26,8 +26,9 @@ export function createInvokeSubagentTool(
     description:
       'Spawn one or more autonomous specialized subagents (e.g. "explore" for read-only codebase search, "coder" for editing, "qa" for tests). ' +
       'Subagents run in isolated child threads with private contexts, preventing master context explosion. ' +
-      'Use the "subagents" array to dispatch multiple subagents concurrently in parallel.',
-    riskLevel: 'READ_ONLY',
+      'Use the "subagents" array to dispatch multiple subagents concurrently in parallel. ' +
+      'NOTE: subagents may write files and run commands — treat as privileged.',
+    riskLevel: 'HIGH_RISK_EXEC',
     parameters: {
       type: 'object',
       properties: {
@@ -98,7 +99,9 @@ export function createInvokeSubagentTool(
         throw new Error('invoke_subagent requires either "subagents" array or "role" and "taskDescription"');
       }
 
-      const results = await subagentManager.runSubagentsBatch(parentThread, tasks);
+      const results = await subagentManager.runSubagentsBatch(parentThread, tasks, {
+        abortSignal: context.abortSignal,
+      });
       return SubagentManager.formatSubagentResults(results);
     },
   };

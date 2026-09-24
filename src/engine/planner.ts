@@ -10,29 +10,65 @@ export interface PlannerConfig {
   defaultSkills?: string[];
 }
 
+const CONVERSATIONAL_EXACT_MATCHES: Set<string> = new Set([
+  '你好', '您好', '嗨', '哈喽', '哈罗', '早', '早上好', '下午好', '晚上好',
+  '在吗', '在不在', '有人吗',
+  'hello', 'hi', 'hey', 'greetings', 'howdy', 'good morning', 'good afternoon', 'good evening',
+  '你是谁', '你是谁？', 'who are you', 'who are you?',
+  '你能做什么', '你能做什么？', '你会做什么', '你会做什么？',
+  '你能干什么', '你能干什么？', '你会干什么', '你会干什么？',
+  '你能干啥', '你能干啥？', '你会干啥', '你会干啥？',
+  '你能帮我做什么', '你会帮我做什么', '你能帮我干嘛', '你能提供什么帮助',
+  '你有什么功能', '你有哪些功能', '你的功能是什么', '功能介绍', '能力介绍',
+  '你有什么能力', '你有哪些能力', '你擅长什么', '你有什么用', '你可以做什么', '你可以帮我做什么',
+  'what can you do', 'what can you do?', 'what do you do', 'what do you do?',
+  'what are your capabilities', 'what are your features', 'how can you help', 'how can you help me',
+  'tell me about yourself',
+  '介绍一下你自己', '介绍下你自己', '自我介绍', '介绍自己', 'introduce yourself',
+  '帮助', 'help', 'hi there', 'hello there', '谢谢', '多谢', '感谢', 'thanks', 'thank you',
+  'ok', '好的', '收到', '明白'
+]);
+
+/**
+ * Extract the first balanced {...} JSON object (string-aware), so trailing
+ * prose can't break parsing like a greedy /\{[\s\S]*\}/ match does.
+ */
+export function extractJsonObject(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr: string | null = null;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === inStr) {
+        inStr = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inStr = ch;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 export function isConversationalGoal(goal: string): boolean {
   if (!goal) return false;
   const trimmed = goal.trim().toLowerCase();
   const clean = trimmed.replace(/[!！?？,，.~。\s]/g, '');
 
-  const exactMatches = new Set([
-    '你好', '您好', '嗨', '哈喽', '哈罗', '早', '早上好', '下午好', '晚上好',
-    '在吗', '在不在', '有人吗',
-    'hello', 'hi', 'hey', 'greetings', 'howdy', 'good morning', 'good afternoon', 'good evening',
-    '你是谁', '你是谁？', 'who are you', 'who are you?',
-    '你能做什么', '你能做什么？', '你会做什么', '你会做什么？',
-    '你能干什么', '你能干什么？', '你会干什么', '你会干什么？',
-    '你能干啥', '你能干啥？', '你会干啥', '你会干啥？',
-    '你能帮我做什么', '你会帮我做什么', '你能帮我干嘛', '你能提供什么帮助',
-    '你有什么功能', '你有哪些功能', '你的功能是什么', '功能介绍', '能力介绍',
-    '你有什么能力', '你有哪些能力', '你擅长什么', '你有什么用', '你可以做什么', '你可以帮我做什么',
-    'what can you do', 'what can you do?', 'what do you do', 'what do you do?',
-    'what are your capabilities', 'what are your features', 'how can you help', 'how can you help me',
-    'tell me about yourself',
-    '介绍一下你自己', '介绍下你自己', '自我介绍', '介绍自己', 'introduce yourself',
-    '帮助', 'help', 'hi there', 'hello there', '谢谢', '多谢', '感谢', 'thanks', 'thank you',
-    'ok', '好的', '收到', '明白'
-  ]);
+  const exactMatches = CONVERSATIONAL_EXACT_MATCHES;
 
   if (exactMatches.has(trimmed) || exactMatches.has(clean)) return true;
 
@@ -140,11 +176,10 @@ Output ONLY valid JSON matching this schema:
         let userPromptContent = `Goal: ${goal}\nProject Root: ${toolContext.workspaceJail.getWorkspaceRoot()}`;
         try {
           const pkgPath = path.join(toolContext.workspaceJail.getWorkspaceRoot(), 'package.json');
-          if (fs.existsSync(pkgPath)) {
-            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-            if (pkg.scripts) {
-              userPromptContent += `\nProject package.json scripts: ${JSON.stringify(pkg.scripts)}`;
-            }
+          const pkgRaw = await fs.promises.readFile(pkgPath, 'utf8');
+          const pkg = JSON.parse(pkgRaw);
+          if (pkg.scripts) {
+            userPromptContent += `\nProject package.json scripts: ${JSON.stringify(pkg.scripts)}`;
           }
         } catch {}
 
@@ -164,10 +199,10 @@ Output ONLY valid JSON matching this schema:
           tokens: response.usage,
         });
 
-        // Parse JSON from response
-        const jsonMatch = response.content?.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
+        // Parse JSON from response (balanced-brace extraction survives trailing prose)
+        const jsonText = response.content ? extractJsonObject(response.content) : null;
+        if (jsonText) {
+          const parsed = JSON.parse(jsonText);
           const milestones: Milestone[] = (parsed.milestones || []).map((m: any) => ({
             id: m.id,
             title: m.title,
@@ -184,6 +219,15 @@ Output ONLY valid JSON matching this schema:
         }
       } catch (err: any) {
         step.end({ status: 'FAILED', errorMessage: err.message });
+        // Don't mask fatal conditions (cancel / auth / missing model) with a
+        // cheerful fallback plan — let the caller fail explicitly.
+        if (
+          toolContext.abortSignal?.aborted ||
+          err?.name === 'AbortError' ||
+          /\[40[134]\]|invalid_api_key|model_not_found|authentication.*failed/i.test(err?.message || '')
+        ) {
+          throw err;
+        }
       }
     } else {
       step.end({ status: 'SUCCESS' });

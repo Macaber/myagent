@@ -1,5 +1,12 @@
 import { OpenAIProvider } from '../provider/openai-provider.js';
-import { CompletionResult, CompletionUsage, ToolCallItem } from '../provider/types.js';
+import { CompletionResult } from '../provider/types.js';
+import {
+  aggregateStream,
+  parseToolCalls,
+  reportParseErrors,
+  runToolCalls,
+  createElicitationBridge,
+} from './agent-loop-core.js';
 import { ToolRegistry, ToolExecutionContext } from '../tools/tool-registry.js';
 import { ToolRouter } from './tool-router.js';
 import { SkillRegistry } from '../skills/skill-registry.js';
@@ -82,6 +89,9 @@ export class DirectAgentLoop {
     const maxStepsPerTurn = maxSteps ?? (Number(process.env.MAX_STEPS_PER_TURN) || 60);
     const maxModelIterations = Number(process.env.MAX_MODEL_ITERATIONS) || 12;
     const loopDetector = new LoopDetector(maxStepsPerTurn, 2, maxModelIterations);
+
+    // ACP elicitation bridge for the `question` tool (shared kernel helper)
+    const requestElicitation = createElicitationBridge(turnContext);
 
     let forcedAnswerAttempt = false;
     let accumulatedTokens = 0;
@@ -195,66 +205,33 @@ export class DirectAgentLoop {
             abortSignal,
           });
 
-          let fullContent = '';
-          const toolCallsMap = new Map<number, { id: string; name: string; args: string }>();
-          let usage: CompletionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-
-          for await (const chunk of stream) {
-            if (chunk.type === 'thought' && chunk.thoughtText) {
-              turnContext.dispatcher?.emitSessionUpdate({
-                sessionId: toolContext.threadId,
-                updateType: 'agent_thought_chunk',
-                sessionUpdate: 'agent_thought_chunk',
-                content: { type: 'text', text: chunk.thoughtText },
-                update: {
-                  sessionUpdate: 'agent_thought_chunk',
-                  content: { type: 'text', text: chunk.thoughtText },
-                },
-                data: { text: chunk.thoughtText },
-                timestamp: Date.now(),
-              });
-            } else if (chunk.type === 'content' && chunk.deltaText) {
-              fullContent += chunk.deltaText;
-              turnContext.dispatcher?.emitSessionUpdate({
-                sessionId: toolContext.threadId,
-                updateType: 'agent_message_chunk',
-                sessionUpdate: 'agent_message_chunk',
-                content: { type: 'text', text: chunk.deltaText },
-                update: {
-                  sessionUpdate: 'agent_message_chunk',
-                  content: { type: 'text', text: chunk.deltaText },
-                },
-                data: { text: chunk.deltaText },
-                timestamp: Date.now(),
-              });
-            } else if (chunk.type === 'tool_call_delta' && chunk.toolCallDelta) {
-              const { index, id, name, argumentsChunk } = chunk.toolCallDelta;
-              const current = toolCallsMap.get(index) ?? { id: '', name: '', args: '' };
-              if (id) current.id = id;
-              if (name) current.name = name;
-              if (argumentsChunk) current.args += argumentsChunk;
-              toolCallsMap.set(index, current);
-            } else if (chunk.type === 'usage' && chunk.usage) {
-              usage = chunk.usage;
-            }
-          }
-
-          const toolCalls: ToolCallItem[] = Array.from(toolCallsMap.entries())
-            .sort(([a], [b]) => a - b)
-            .map(([_, val]) => ({
-              id: val.id || `call_${Date.now()}`,
-              type: 'function',
-              function: {
-                name: val.name,
-                arguments: val.args,
+          const emitChunk = (
+            updateType: 'agent_thought_chunk' | 'agent_message_chunk',
+            text: string
+          ) => {
+            turnContext.dispatcher?.emitSessionUpdate({
+              sessionId: toolContext.threadId,
+              updateType,
+              sessionUpdate: updateType,
+              content: { type: 'text', text },
+              update: {
+                sessionUpdate: updateType,
+                content: { type: 'text', text },
               },
-            }));
-
-          response = {
-            content: fullContent.length > 0 ? fullContent : null,
-            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-            usage,
+              data: { text },
+              timestamp: Date.now(),
+            });
           };
+
+          // Shared kernel: fold SSE deltas (content/thought/tool_calls/usage)
+          response = await aggregateStream(
+            stream,
+            {
+              onThought: (t) => emitChunk('agent_thought_chunk', t),
+              onContent: (t) => emitChunk('agent_message_chunk', t),
+            },
+            undefined
+          );
 
           if (response.usage) {
             accumulatedTokens += response.usage.totalTokens;
@@ -300,101 +277,50 @@ export class DirectAgentLoop {
           };
         }
 
-        // 7. Execute Tool Calls
-        for (const tc of response.toolCalls) {
-          const toolName = tc.function.name;
-          let parsedArgs: Record<string, any> = {};
-          try {
-            parsedArgs = JSON.parse(tc.function.arguments || '{}');
-          } catch {
-            parsedArgs = {};
+        // 7. Execute Tool Calls (shared AgentLoopCore kernel:
+        // strict arg parsing, read-parallel/write-serial, ordered steps)
+        {
+          const { executable, parseErrors } = parseToolCalls(response.toolCalls);
+          const runCtx = {
+            toolRegistry,
+            turnContext,
+            toolContext,
+            loopDetector,
+            requestElicitation,
+          };
+          for (const msg of reportParseErrors(runCtx, parseErrors)) {
+            totalStepsCount++;
+            messages.push({
+              role: 'tool',
+              tool_call_id: msg.tool_call_id,
+              toolName: 'parse_error',
+              content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+              isError: true,
+              timestamp: Date.now(),
+            } as ToolResultMessage);
           }
-
-          const toolCallId = tc.id || `call_${Date.now()}`;
-
-          // Emit tool_call start update for Zed UI / TUI
-          turnContext.dispatcher?.emitSessionUpdate({
-            sessionId: toolContext.threadId,
-            updateType: 'tool_call',
-            sessionUpdate: 'tool_call',
-            update: {
-              sessionUpdate: 'tool_call',
-              toolCallId,
-              title: toolName,
-              kind:
-                toolName === 'read' || toolName === 'grep' || toolName === 'glob'
-                  ? 'read'
-                  : toolName === 'edit' || toolName === 'write' || toolName === 'patch'
-                  ? 'edit'
-                  : toolName === 'bash'
-                  ? 'execute'
-                  : 'other',
-              status: 'in_progress',
-              rawInput: parsedArgs,
-            },
-            timestamp: Date.now(),
-          });
-
-          totalStepsCount++;
-          const toolStep = turnContext.createStep({
-            stepType: 'TOOL_EXECUTION',
-            toolName,
-            metadata: { args: parsedArgs },
-          });
-
-          const executionResult = await toolRegistry.executeTool(toolName, parsedArgs, {
-            ...toolContext,
-            turnId: turnContext.turnId,
-            stepId: toolStep.stepId,
-          });
-
-          const hasError = !!executionResult.error;
-          loopDetector.recordAction(toolName, parsedArgs, hasError);
-
-          const toolOutputText = executionResult.output || executionResult.error || '';
-
-          // Emit tool_call_update for Zed UI / TUI
-          turnContext.dispatcher?.emitSessionUpdate({
-            sessionId: toolContext.threadId,
-            updateType: 'tool_call_update',
-            sessionUpdate: 'tool_call_update',
-            update: {
-              sessionUpdate: 'tool_call_update',
-              toolCallId,
-              status: hasError ? 'failed' : 'completed',
-              content: [{ type: 'content', content: { type: 'text', text: toolOutputText.slice(0, 2000) } }],
-              rawOutput: toolOutputText,
-            },
-            timestamp: Date.now(),
-          });
-
-          toolStep.end({
-            status: hasError ? 'FAILED' : 'SUCCESS',
-            errorMessage: executionResult.error,
-          });
-
-          // Check if error is Fatal
-          if (hasError) {
-            const classified = ErrorClassifier.classify(executionResult.error!);
-            if (classified.severity === 'FATAL') {
-              return {
-                status: 'FAILED',
-                summary: `Fatal tool failure in ${toolName}: ${executionResult.error}`,
-                error: executionResult.error,
-                totalSteps: totalStepsCount,
-              };
+          if (executable.length > 0) {
+            const executed = await runToolCalls(runCtx, executable);
+            totalStepsCount += executed.length;
+            for (const e of executed) {
+              if (e.fatalError) {
+                return {
+                  status: 'FAILED',
+                  summary: `Fatal tool failure in ${e.toolName}: ${e.fatalError}`,
+                  error: e.fatalError,
+                  totalSteps: totalStepsCount,
+                };
+              }
+              messages.push({
+                role: 'tool',
+                tool_call_id: e.toolCallId,
+                toolName: e.toolName,
+                content: e.output,
+                isError: e.hasError,
+                timestamp: Date.now(),
+              });
             }
           }
-
-          // Add Tool Result message
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCallId,
-            toolName,
-            content: toolOutputText,
-            isError: hasError,
-            timestamp: Date.now(),
-          });
         }
 
         // 8. In-Turn Steering Check: Pick up steering messages queued while tools were executing

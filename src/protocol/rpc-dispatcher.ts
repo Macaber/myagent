@@ -36,7 +36,11 @@ export class RpcDispatcher {
   private nextRequestId = 1;
 
   constructor(private readonly transport: AcpTransport) {
-    this.transport.onMessage((msg) => this.handleIncomingMessage(msg));
+    this.transport.onMessage((msg) => {
+      this.handleIncomingMessage(msg).catch((err) => {
+        console.error('[RpcDispatcher] Unhandled incoming message error:', err);
+      });
+    });
 
     // Built-in standard JSON-RPC cancellation notification: $/cancel_request
     this.registerNotification<CancelRequestNotification>('$/cancel_request', (params) => {
@@ -134,11 +138,37 @@ export class RpcDispatcher {
           this.pendingClientRequests.delete(id);
           reject(new Error(`ACP request '${method}' timed out after ${timeoutMs}ms`));
         }, timeoutMs);
+        (timer as any)?.unref?.();
       }
 
       this.pendingClientRequests.set(id, { resolve, reject, timer });
-      this.transport.send(request);
+      try {
+        this.transport.send(request);
+      } catch (err) {
+        if (timer) clearTimeout(timer);
+        this.pendingClientRequests.delete(id);
+        reject(err);
+      }
     });
+  }
+
+  /**
+   * Reject all pending client requests (transport close / shutdown).
+   */
+  public closePendingRequests(reason = 'Dispatcher closed'): void {
+    for (const [id, pending] of this.pendingClientRequests) {
+      if (pending.timer) clearTimeout(pending.timer);
+      try {
+        pending.reject(new Error(reason));
+      } catch {}
+      this.pendingClientRequests.delete(id);
+    }
+    for (const [, controller] of this.activeIncomingRequests) {
+      try {
+        controller.abort();
+      } catch {}
+    }
+    this.activeIncomingRequests.clear();
   }
 
   private async handleIncomingMessage(
@@ -161,6 +191,8 @@ export class RpcDispatcher {
         } else {
           pending.resolve(response.result);
         }
+      } else {
+        console.warn(`[RpcDispatcher] Unknown response id '${String(response.id)}' (no pending request)`);
       }
       return;
     }
@@ -168,6 +200,28 @@ export class RpcDispatcher {
     // 2. If it's an incoming Request from the peer
     if ('method' in message && 'id' in message) {
       const request = message as JsonRpcRequest;
+      if ((request as any).jsonrpc !== undefined && (request as any).jsonrpc !== '2.0') {
+        this.transport.send({
+          jsonrpc: '2.0',
+          id: request.id,
+          error: {
+            code: ACP_ERROR_CODES.INVALID_REQUEST,
+            message: `Unsupported jsonrpc version '${(request as any).jsonrpc}'`,
+          },
+        });
+        return;
+      }
+      if (this.activeIncomingRequests.has(request.id)) {
+        this.transport.send({
+          jsonrpc: '2.0',
+          id: request.id,
+          error: {
+            code: ACP_ERROR_CODES.INVALID_REQUEST,
+            message: `Duplicate request id '${String(request.id)}' is already in flight`,
+          },
+        });
+        return;
+      }
       const handler = this.methodHandlers.get(request.method);
       if (!handler) {
         this.transport.send({
@@ -195,10 +249,10 @@ export class RpcDispatcher {
         const isCancelled = abortController.signal.aborted || err?.name === 'AbortError';
         const code = isCancelled
           ? ACP_ERROR_CODES.REQUEST_CANCELLED
-          : err.code || ACP_ERROR_CODES.INTERNAL_ERROR;
+          : (err?.code ?? ACP_ERROR_CODES.INTERNAL_ERROR);
         const message = isCancelled
           ? 'Request cancelled'
-          : err.message || 'Internal error occurred';
+          : err?.message || 'Internal error occurred';
 
         this.transport.send({
           jsonrpc: '2.0',
@@ -206,7 +260,7 @@ export class RpcDispatcher {
           error: {
             code,
             message,
-            data: err.data,
+            ...(err?.data !== undefined ? { data: err.data } : {}),
           },
         });
       } finally {

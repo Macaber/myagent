@@ -21,6 +21,65 @@ function getDashboardHtmlPath(): string {
   return cand1;
 }
 
+// Cache dashboard HTML in memory (mtime-guarded) instead of readFileSync per request
+let cachedHtml: { mtimeMs: number; size: number; content: string; etag: string } | null = null;
+
+function getCachedDashboardHtml(htmlPath: string): { content: string; etag: string } | null {
+  try {
+    const stat = fs.statSync(htmlPath);
+    if (
+      cachedHtml &&
+      cachedHtml.mtimeMs === stat.mtimeMs &&
+      cachedHtml.size === stat.size
+    ) {
+      return { content: cachedHtml.content, etag: cachedHtml.etag };
+    }
+    const content = fs.readFileSync(htmlPath, 'utf8');
+    const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
+    cachedHtml = { mtimeMs: stat.mtimeMs, size: stat.size, content, etag };
+    return { content, etag };
+  } catch {
+    cachedHtml = null;
+    return null;
+  }
+}
+
+// Bounded JSON body reader for dashboard POST routes (1MB cap, fail-closed)
+function readBoundedJsonBody(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  onBody: (payload: any) => void
+): void {
+  let body = '';
+  let rejected = false;
+  req.setEncoding('utf8');
+  req.on('data', (chunk) => {
+    if (rejected) return;
+    body += chunk;
+    if (body.length > 1024 * 1024) {
+      rejected = true;
+      try {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Request body too large (max 1MB)' }));
+      } catch {}
+      try {
+        req.destroy();
+      } catch {}
+    }
+  });
+  req.on('end', () => {
+    if (rejected) return;
+    try {
+      onBody(JSON.parse(body || '{}'));
+    } catch (err: any) {
+      try {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Invalid JSON: ${err.message}` }));
+      } catch {}
+    }
+  });
+}
+
 export function handleDashboardHttpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -31,13 +90,19 @@ export function handleDashboardHttpRequest(
   // 1. Static Dashboard HTML
   if (req.method === 'GET' && (pathname === '/dashboard' || pathname === '/dashboard/' || pathname === '/dashboard/index.html')) {
     const htmlPath = getDashboardHtmlPath();
-    if (fs.existsSync(htmlPath)) {
-      const content = fs.readFileSync(htmlPath, 'utf8');
+    const cached = getCachedDashboardHtml(htmlPath);
+    if (cached) {
+      if (req.headers['if-none-match'] === cached.etag) {
+        res.writeHead(304);
+        res.end();
+        return true;
+      }
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-cache',
+        ETag: cached.etag,
       });
-      res.end(content);
+      res.end(cached.content);
       return true;
     } else {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -106,30 +171,44 @@ export function handleDashboardHttpRequest(
     return true;
   }
 
-  // GET /api/dashboard/export
+  // GET /api/dashboard/export (streamed: O(1) memory, capped sessions)
   if (req.method === 'GET' && pathname === '/api/dashboard/export') {
-    const fullJson = DashboardService.exportFullDatabaseJson(requestedDb);
     const dbName = requestedDb || 'data.db';
     const filename = `myagent-export-${dbName.replace(/[^a-zA-Z0-9_-]/g, '_')}-${Date.now()}.json`;
+    const limitRaw = Number(url.searchParams.get('limit') || '');
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 5000) : 500;
 
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Content-Disposition': `attachment; filename="${filename}"`,
+      'Transfer-Encoding': 'chunked',
     });
-    res.end(JSON.stringify(fullJson, null, 2));
+    try {
+      DashboardService.streamDatabaseExport(
+        requestedDb,
+        (chunk) => {
+          try {
+            res.write(chunk);
+          } catch {}
+        },
+        undefined,
+        { limit }
+      );
+    } catch (err: any) {
+      try {
+        res.write(JSON.stringify({ exportError: err?.message || String(err) }));
+      } catch {}
+    }
+    try {
+      res.end();
+    } catch {}
     return true;
   }
 
   // POST /api/dashboard/session/set-status & POST /api/dashboard/thread/set-status
   if (req.method === 'POST' && (pathname === '/api/dashboard/session/set-status' || pathname === '/api/dashboard/thread/set-status')) {
-    let body = '';
-    req.setEncoding('utf8');
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', () => {
+    readBoundedJsonBody(req, res, (payload) => {
       try {
-        const payload = JSON.parse(body || '{}');
         const id = payload.sessionId || payload.threadId;
         const status = payload.status || 'SUSPENDED';
         const db = payload.db || requestedDb;
@@ -153,14 +232,8 @@ export function handleDashboardHttpRequest(
 
   // POST /api/dashboard/session/resume & POST /api/dashboard/thread/resume
   if (req.method === 'POST' && (pathname === '/api/dashboard/session/resume' || pathname === '/api/dashboard/thread/resume')) {
-    let body = '';
-    req.setEncoding('utf8');
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', async () => {
+    readBoundedJsonBody(req, res, async (payload) => {
       try {
-        const payload = JSON.parse(body || '{}');
         const id = payload.sessionId || payload.threadId;
         const prompt = payload.prompt;
         const mode = payload.mode || 'continue';
@@ -186,14 +259,8 @@ export function handleDashboardHttpRequest(
 
   // POST /api/dashboard/session/delete & POST /api/dashboard/thread/delete
   if (req.method === 'POST' && (pathname === '/api/dashboard/session/delete' || pathname === '/api/dashboard/thread/delete')) {
-    let body = '';
-    req.setEncoding('utf8');
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', () => {
+    readBoundedJsonBody(req, res, (payload) => {
       try {
-        const payload = JSON.parse(body || '{}');
         const id = payload.sessionId || payload.threadId;
         const db = payload.db || requestedDb;
 
@@ -216,14 +283,8 @@ export function handleDashboardHttpRequest(
 
   // POST /api/dashboard/database/clear
   if (req.method === 'POST' && pathname === '/api/dashboard/database/clear') {
-    let body = '';
-    req.setEncoding('utf8');
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', () => {
+    readBoundedJsonBody(req, res, (payload) => {
       try {
-        const payload = JSON.parse(body || '{}');
         const db = payload.db || requestedDb;
         const success = DashboardService.clearDatabaseHistory(db);
         res.writeHead(200, { 'Content-Type': 'application/json' });

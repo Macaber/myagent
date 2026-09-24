@@ -90,8 +90,14 @@ export class HttpTransport implements AcpTransport {
 
     for (const [, res] of this.pendingHttpResponses) {
       try {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Server closing' }));
+        if (!res.headersSent && !res.writableEnded) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Server closing' }));
+        } else {
+          try {
+            res.end();
+          } catch {}
+        }
       } catch {}
     }
     this.pendingHttpResponses.clear();
@@ -158,17 +164,43 @@ export class HttpTransport implements AcpTransport {
     // POST /rpc or POST /message
     if (req.method === 'POST' && (url.pathname === '/rpc' || url.pathname === '/message')) {
       let body = '';
+      let bodyTooLarge = false;
       req.setEncoding('utf8');
       req.on('data', (chunk) => {
+        if (bodyTooLarge) return;
         body += chunk;
+        if (body.length > 1024 * 1024) {
+          bodyTooLarge = true;
+          try {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: ACP_ERROR_CODES.INVALID_REQUEST, message: 'Request body too large (max 1MB)' },
+            }));
+          } catch {}
+          try {
+            req.destroy();
+          } catch {}
+        }
       });
 
       req.on('end', () => {
+        if (bodyTooLarge) return;
         try {
           const parsed = JSON.parse(body);
 
           // If request has an ID, keep HTTP response open until send(response) is called
           if ('id' in parsed && parsed.id !== undefined) {
+            if (this.pendingHttpResponses.has(parsed.id)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                jsonrpc: '2.0',
+                id: parsed.id,
+                error: { code: ACP_ERROR_CODES.INVALID_REQUEST, message: `Duplicate request id '${String(parsed.id)}' is already in flight` },
+              }));
+              return;
+            }
             this.pendingHttpResponses.set(parsed.id, res);
 
             // If client aborts before response is sent

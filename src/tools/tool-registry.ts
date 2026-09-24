@@ -13,6 +13,17 @@ export interface ToolExecutionContext {
   workspaceJail: WorkspaceJail;
   blackboard: Blackboard;
   abortSignal?: AbortSignal;
+  /**
+   * Optional ACP elicitation bridge (wired by Worker/DirectAgentLoop when a
+   * dispatcher is available). Allows `question` to truly block on user input
+   * instead of returning a fake prompt string.
+   */
+  requestElicitation?: (params: {
+    question: string;
+    options?: string[];
+    threadId: string;
+    turnId?: string;
+  }) => Promise<{ answer?: string; action: string }>;
 }
 
 export interface AgentTool<TParams = any> {
@@ -76,8 +87,16 @@ export class ToolRegistry {
       throw new Error(`Tool '${name}' is not registered`);
     }
 
-    // 1. HITL & Security Gate Check
+    // 1. HITL & Security Gate Check (extract every path-like param so jail can't be bypassed)
     if (this.approvalGate) {
+      const filePath =
+        rawParams?.filePath ??
+        rawParams?.path ??
+        rawParams?.dirPath ??
+        rawParams?.cwd ??
+        rawParams?.file_path ??
+        rawParams?.directory ??
+        undefined;
       await this.approvalGate.checkAndRequestApproval({
         threadId: context.threadId,
         turnId: context.turnId,
@@ -85,8 +104,8 @@ export class ToolRegistry {
         toolName: tool.name,
         riskLevel: tool.riskLevel,
         description: `Execute tool '${tool.name}'`,
-        filePath: rawParams.filePath || rawParams.path,
-        command: rawParams.command,
+        filePath: typeof filePath === 'string' ? filePath : undefined,
+        command: rawParams?.command,
         metadata: rawParams,
       });
     }

@@ -23,7 +23,8 @@ export class PolicyEngine {
     filePath?: string;
     command?: string;
   }): { requiresApproval: boolean; reason?: string } {
-    const { riskLevel, filePath } = params;
+    const { filePath } = params;
+    const riskLevel = (String(params.riskLevel || '').toUpperCase() || 'UNKNOWN') as PermissionRiskLevel;
 
     // 1. Verify workspace jail if path is provided
     if (filePath) {
@@ -77,19 +78,22 @@ export class PolicyEngine {
   public isReadOnlyCommand(command: string): boolean {
     if (!command || command.trim().length === 0) return false;
 
-    // 1. Disallow write/redirect operators (>, >>, &>, 1>, 2>, >|)
-    if (/(?:^|[^<])>[^&]/i.test(command) || />>/.test(command)) {
+    // 0. Reject shell expansions / home / glob metachars outright
+    // ($VAR, ${VAR}, $(), ~, backticks are handled below but fail closed here)
+    if (/[$`~]/.test(command)) {
       return false;
     }
 
-    // 2. Disallow subshell substitution ($(..), `..`)
-    if (/\$\(/.test(command) || /`/.test(command)) {
+    // 1. Disallow write/redirect operators (>, >>, &>, 1>, 2>, >|, <)
+    if (/[<>]/.test(command)) {
       return false;
     }
 
     // 3. Known mutating commands or dangerous utilities
-    const dangerousCommands = /\b(rm|rmdir|mv|cp|touch|mkdir|chmod|chown|kill|pkill|sudo|su|curl|wget|ssh|scp|rsync|tee|dd|mkfs|fdisk|reboot|shutdown|sed\s+-i)\b/i;
+    const dangerousCommands = /\b(rm|rmdir|mv|cp|touch|mkdir|chmod|chown|kill|pkill|sudo|su|curl|wget|ssh|scp|rsync|tee|dd|mkfs|fdisk|reboot|shutdown|python|python3|perl|ruby|php|sh|bash|zsh|fish|nc|ncat|socat|ftp|tftp|lftp|apt|apt-get|yum|dnf|brew|pip|docker|kubectl|helm|ed|vi|vim|nano|emacs|sed)\b/i;
     if (dangerousCommands.test(command)) {
+      // Allowlist narrow carve-outs below (e.g. safe git); sed is never read-only
+      // (sed -i variants, w commands). Keep fail-closed for interpreters/shells.
       return false;
     }
 
@@ -103,7 +107,7 @@ export class PolicyEngine {
       'echo', 'printf', 'grep', 'egrep', 'fgrep', 'awk', 'cut', 'sort', 'uniq', 'tr', 'column',
       'diff', 'cmp', 'test', '[', '[[',
       'which', 'whereis', 'uname', 'whoami',
-      'git', 'node', 'npm', 'pnpm', 'yarn', 'python', 'python3', 'cargo', 'go'
+      'git', 'node', 'npm', 'pnpm', 'yarn', 'cargo', 'go'
     ]);
 
     for (const segment of segments) {
@@ -126,13 +130,14 @@ export class PolicyEngine {
 
       if (baseCmd === 'npm' || baseCmd === 'pnpm' || baseCmd === 'yarn') {
         const subCmd = tokens[1]?.toLowerCase();
-        const safePkgSubcommands = new Set(['-v', '--version', 'list', 'ls', 'view', 'info']);
+        // NOTE: view/info hit the registry (network) — not read-only.
+        const safePkgSubcommands = new Set(['-v', '--version', 'list', 'ls']);
         if (!subCmd || !safePkgSubcommands.has(subCmd)) {
           return false;
         }
       }
 
-      if (baseCmd === 'node' || baseCmd === 'python' || baseCmd === 'python3' || baseCmd === 'cargo' || baseCmd === 'go') {
+      if (baseCmd === 'node' || baseCmd === 'cargo' || baseCmd === 'go') {
         const subCmd = tokens[1]?.toLowerCase();
         if (subCmd !== '-v' && subCmd !== '--version' && subCmd !== 'version') {
           return false;

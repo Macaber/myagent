@@ -124,7 +124,22 @@ export class ThreadContext {
     if (this.turnCounter < existingCount) {
       this.turnCounter = existingCount;
     }
-    const turnId = `${this.threadId}_turn_${this.turnCounter++}`;
+    // Ensure turnId uniqueness even under concurrent createTurn calls
+    // (turn_id is PRIMARY KEY; collision would throw on INSERT).
+    let turnId = `${this.threadId}_turn_${this.turnCounter++}`;
+    try {
+      const rawDb = (this.db as any).getRawDb?.();
+      if (rawDb) {
+        let guard = 0;
+        while (guard++ < 100) {
+          const row = rawDb.prepare('SELECT 1 as ok FROM turns WHERE turn_id = ? LIMIT 1').get(turnId) as any;
+          if (!row) break;
+          turnId = `${this.threadId}_turn_${this.turnCounter++}`;
+        }
+      }
+    } catch {
+      // Best-effort only; TurnContext constructor will surface real DB errors.
+    }
     this.currentTurn = new TurnContext(
       {
         turnId,
@@ -156,13 +171,14 @@ export class ThreadContext {
   public setExecutionPlan(plan?: ExecutionPlan): void {
     this.executionPlan = plan;
     if (plan) {
-      this.blackboard.set('__execution_plan__', plan.toJSON());
+      const planJson = plan.toJSON();
+      this.blackboard.set('__execution_plan__', planJson);
 
       this.eventStore.appendEvent({
         threadId: this.threadId,
         turnId: this.currentTurn?.turnId,
         eventType: 'PLAN_GENERATED',
-        payload: plan.toJSON(),
+        payload: planJson,
         createdAt: Date.now(),
       });
 
@@ -186,17 +202,31 @@ export class ThreadContext {
           entries,
         },
         timestamp: Date.now(),
-        data: plan.toJSON(),
+        data: planJson,
       });
       this.dispatcher?.emitTaskEvent({
         threadId: this.threadId,
         turnId: this.currentTurn?.turnId,
         type: 'PLAN_GENERATED',
         timestamp: Date.now(),
-        data: plan.toJSON(),
+        data: planJson,
       });
     } else {
       this.blackboard.delete('__execution_plan__');
+    }
+  }
+
+  /**
+   * Persist plan progress without re-emitting plan_generated
+   * (called after each milestone status change so crash recovery keeps progress).
+   */
+  public persistExecutionPlan(): void {
+    if (this.executionPlan) {
+      try {
+        this.blackboard.set('__execution_plan__', this.executionPlan.toJSON());
+      } catch {
+        // Best-effort: execution continues even if persistence fails.
+      }
     }
   }
 
@@ -208,6 +238,35 @@ export class ThreadContext {
       return this.executionPlan;
     }
     return undefined;
+  }
+
+  public cancel(cancelMessage = 'Task cancelled by user'): ThreadMetricsReport {
+    this.setState('CANCELLED');
+    this.telemetryStore.recordThreadEnd(this.threadId, 'CANCELLED', cancelMessage);
+
+    const report = this.telemetryStore.getThreadMetrics(this.threadId);
+
+    this.eventStore.appendEvent({
+      threadId: this.threadId,
+      eventType: 'THREAD_CANCELLED',
+      payload: { message: cancelMessage, report },
+      createdAt: Date.now(),
+    });
+
+    this.dispatcher?.emitSessionUpdate({
+      sessionId: this.threadId,
+      updateType: 'state_changed',
+      timestamp: Date.now(),
+      data: { state: 'CANCELLED', message: cancelMessage, report },
+    });
+    this.dispatcher?.emitTaskEvent({
+      threadId: this.threadId,
+      type: 'THREAD_CANCELLED',
+      timestamp: Date.now(),
+      data: { message: cancelMessage, report },
+    });
+
+    return report;
   }
 
   public complete(summary?: string): ThreadMetricsReport {

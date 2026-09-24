@@ -1,5 +1,3 @@
-import { createHash } from 'node:crypto';
-
 export interface ActionFingerprint {
   toolName: string;
   paramsHash: string;
@@ -14,6 +12,36 @@ export interface BudgetStatus {
   maxToolExecutions: number;
   shouldWarnBudget: boolean;
   shouldForceAnswer: boolean;
+}
+
+// FNV-1a 32-bit: cheap non-crypto hash for hot-path fingerprinting
+function fnv1a(str: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+// Stable normalization: sorted keys, trimmed strings, so whitespace-only
+// or key-order differences can't dodge loop detection.
+function normalizeParams(raw: any): string {
+  const norm = (v: any): any => {
+    if (typeof v === 'string') return v.trim();
+    if (Array.isArray(v)) return v.map(norm);
+    if (v && typeof v === 'object') {
+      const out: Record<string, any> = {};
+      for (const k of Object.keys(v).sort()) out[k] = norm(v[k]);
+      return out;
+    }
+    return v;
+  };
+  try {
+    return JSON.stringify(norm(raw) ?? {});
+  } catch {
+    return String(raw);
+  }
 }
 
 export class LoopDetector {
@@ -56,8 +84,7 @@ export class LoopDetector {
   }
 
   public recordAction(toolName: string, rawParams: any, failed: boolean): void {
-    const paramsStr = typeof rawParams === 'string' ? rawParams : JSON.stringify(rawParams);
-    const paramsHash = createHash('sha256').update(paramsStr).digest('hex').slice(0, 16);
+    const paramsHash = fnv1a(`${toolName}:${normalizeParams(rawParams)}`);
 
     this.history.push({
       toolName,
@@ -68,7 +95,8 @@ export class LoopDetector {
 
     // If edit/write, track file target + content snippet hash
     if (toolName === 'edit' || toolName === 'write') {
-      const target = `${rawParams.filePath || 'unknown'}:${createHash('md5').update(String(rawParams.newStr || rawParams.content || '')).digest('hex').slice(0, 8)}`;
+      const params = typeof rawParams === 'object' && rawParams !== null ? rawParams : {};
+      const target = `${params.filePath || 'unknown'}:${fnv1a(String(params.newStr ?? params.content ?? ''))}`;
       this.editTargetHistory.push(target);
       if (this.editTargetHistory.length > 8) {
         this.editTargetHistory.shift();
@@ -102,13 +130,35 @@ export class LoopDetector {
       }
     }
 
-    // 3. Check oscillation (A -> B -> A) in edits
-    if (this.editTargetHistory.length >= 3) {
-      const n = this.editTargetHistory.length;
-      if (this.editTargetHistory[n - 1] === this.editTargetHistory[n - 3] && this.editTargetHistory[n - 1] !== this.editTargetHistory[n - 2]) {
+    // 2b. Check identical consecutive calls regardless of outcome (successful
+    // repeats like re-reading the same file are loops too). Higher threshold
+    // so normal retries don't trip.
+    const repeatThreshold = Math.max(4, this.maxConsecutiveSameAction * 2);
+    if (this.history.length >= repeatThreshold) {
+      const recent = this.history.slice(-repeatThreshold);
+      const allSame = recent.every(
+        (a) => a.toolName === recent[0].toolName && a.paramsHash === recent[0].paramsHash
+      );
+      if (allSame) {
         return {
           tripped: true,
-          reason: `Detected cognitive oscillation: Ping-pong file modifications detected (${this.editTargetHistory[n - 1]} <-> ${this.editTargetHistory[n - 2]}). Halting to prevent thrashing.`,
+          reason: `Detected dead-loop: Tool '${recent[0].toolName}' called ${repeatThreshold} times consecutively with identical arguments.`,
+        };
+      }
+    }
+
+    // 3. Check oscillation in edits: last target repeats any earlier target
+    // within the window with a different edit in between (A-B-A, A-B-C-A, ...).
+    const window = this.editTargetHistory.slice(-6);
+    if (window.length >= 3) {
+      const last = window[window.length - 1];
+      const earlier = window.slice(0, -1);
+      const prevIdx = earlier.lastIndexOf(last);
+      if (prevIdx !== -1 && earlier.slice(prevIdx + 1).some((t) => t !== last)) {
+        const other = earlier.slice(prevIdx + 1).find((t) => t !== last)!;
+        return {
+          tripped: true,
+          reason: `Detected cognitive oscillation: Ping-pong file modifications detected (${last} <-> ${other}). Halting to prevent thrashing.`,
         };
       }
     }
@@ -119,5 +169,6 @@ export class LoopDetector {
   public resetTurn(): void {
     this.history = [];
     this.editTargetHistory = [];
+    this.modelIterations = 0;
   }
 }

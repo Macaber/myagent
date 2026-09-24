@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import { AgentTool, ToolExecutionContext } from './tool-registry.js';
 import { TodoItem } from '../context/blackboard.js';
 import { getSkillsDir } from '../config/paths.js';
+import { withFileLock } from './file-lock.js';
 
 // =================== 1. todowrite ===================
 export const todoWriteTool: AgentTool<{ todos: TodoItem[] }> = {
@@ -73,6 +74,10 @@ export const skillTool: AgentTool<{ skillName?: string; action?: 'get' | 'list' 
     }
 
     const name = params.skillName || 'developer';
+    // Block path traversal (../../etc/passwd) — skill names are bare identifiers.
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+      throw new Error(`Invalid skill name '${name}': must match /^[a-zA-Z0-9_-]+$/`);
+    }
     const candidatePaths = [
       `${globalSkillsDir}/${name}/SKILL.md`,
       `${globalSkillsDir}/${name}.md`,
@@ -95,7 +100,9 @@ export const skillTool: AgentTool<{ skillName?: string; action?: 'get' | 'list' 
 // =================== 3. question ===================
 export const questionTool: AgentTool<{ question: string; options?: string[] }> = {
   name: 'question',
-  description: 'Ask the user a question to clarify ambiguous instructions, gather preferences, or request decisions.',
+  description:
+    'Ask the user a question to clarify ambiguous instructions, gather preferences, or request decisions. ' +
+    'Blocks on elicitation when an ACP client is connected; otherwise records the question for later review.',
   riskLevel: 'READ_ONLY',
   parameters: {
     type: 'object',
@@ -109,9 +116,30 @@ export const questionTool: AgentTool<{ question: string; options?: string[] }> =
     },
     required: ['question'],
   },
-  async execute(params) {
-    // In actual ACP runtime, this is emitted as an interaction event
-    return `User Question Prompted: "${params.question}"${params.options ? ` Options: [${params.options.join(', ')}]` : ''}`;
+  async execute(params, context) {
+    if (!params.question || typeof params.question !== 'string' || params.question.trim().length === 0) {
+      throw new Error('question requires a non-empty question string');
+    }
+    const question = params.question.slice(0, 2000);
+    if (context.requestElicitation) {
+      const res = await context.requestElicitation({
+        question,
+        options: params.options,
+        threadId: context.threadId,
+        turnId: context.turnId,
+      });
+      const answer = res.answer ?? `[${res.action}]`;
+      try {
+        context.blackboard.set(`question_${Date.now()}`, { question, answer, action: res.action });
+      } catch {}
+      return `User response (${res.action}): ${answer}`;
+    }
+    // Headless fallback: record explicitly as UNANSWERED so the model
+    // does not hallucinate a user reply.
+    try {
+      context.blackboard.set(`question_${Date.now()}`, { question, answer: null, action: 'unanswered' });
+    } catch {}
+    return `User Question Recorded (UNANSWERED — no ACP client connected): "${question}"${params.options ? ` Options: [${params.options.join(', ')}]` : ''}. Proceed with best judgement and note the assumption.`;
   },
 };
 
@@ -129,18 +157,107 @@ export const patchTool: AgentTool<{ filePath: string; patch: string }> = {
     required: ['filePath', 'patch'],
   },
   async execute(params, context) {
+    if (!params.patch || typeof params.patch !== 'string') {
+      throw new Error('patch requires a unified diff string');
+    }
+    if (params.patch.length > 256 * 1024) {
+      throw new Error('patch exceeds 256KB limit');
+    }
     const fullPath = context.workspaceJail.resolvePath(params.filePath);
+    // Serialize writers per file (see file-lock.ts)
+    return withFileLock(fullPath, async () => {
     if (!fs.existsSync(fullPath)) {
       throw new Error(`Target file ${params.filePath} not found`);
     }
 
+    const original = fs.readFileSync(fullPath, 'utf8').split('\n');
+    const patchLines = params.patch.split('\n');
+    interface Hunk {
+      oldStart: number;
+      oldLines: number;
+      newLines: string[];
+      removals: string[];
+    }
+    const hunks: Hunk[] = [];
+    let i = 0;
+    while (i < patchLines.length) {
+      const line = patchLines[i];
+      const m = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
+      if (m) {
+        const oldStart = Number(m[1]);
+        const oldLines = m[2] === undefined ? 1 : Number(m[2]);
+        const hunk: Hunk = { oldStart, oldLines, newLines: [], removals: [] };
+        i++;
+        while (i < patchLines.length && !patchLines[i].startsWith('@@')) {
+          const h = patchLines[i];
+          if (h === '' && i === patchLines.length - 1) {
+            i++; // patch trailing newline — not a hunk line
+            continue;
+          }
+          if (h.startsWith('---') || h.startsWith('+++')) {
+            i++;
+            continue;
+          }
+          const marker = h[0];
+          const text = h.slice(1);
+          if (marker === ' ') {
+            hunk.newLines.push(text);
+          } else if (h === '' && i !== patchLines.length - 1) {
+            // Bare empty line inside a hunk = empty context line (not patch trailing newline)
+            hunk.newLines.push('');
+          } else if (marker === '-') {
+            hunk.removals.push(text);
+          } else if (marker === '+') {
+            hunk.newLines.push(text);
+          } else if (marker === '\\') {
+            // "\ No newline at end of file" — ignore
+          } else {
+            throw new Error(`Invalid hunk line: '${h.slice(0, 60)}' (expected ' '/-/+/@@)`);
+          }
+          i++;
+        }
+        hunks.push(hunk);
+        continue;
+      }
+      i++;
+    }
+    if (hunks.length === 0) {
+      throw new Error('No @@ hunks found in patch — refusing to apply');
+    }
+
+    // Apply bottom-up so earlier line numbers stay valid
+    const result = [...original];
+    const sorted = [...hunks].sort((a, b) => b.oldStart - a.oldStart);
+    for (const h of sorted) {
+      const idx = h.oldStart - 1; // 1-based to 0-based
+      if (idx < 0 || idx + h.oldLines > result.length + (h.oldLines === 0 ? 1 : 0)) {
+        throw new Error(`Hunk at line ${h.oldStart} out of range (file has ${result.length} lines)`);
+      }
+      const slice = result.slice(idx, idx + h.oldLines);
+      let si = 0;
+      for (const r of h.removals) {
+        const found = slice.indexOf(r, si);
+        if (found === -1) {
+          throw new Error(
+            `Hunk at line ${h.oldStart} does not match file: expected to remove '${r.slice(0, 80)}'`
+          );
+        }
+        si = found + 1;
+      }
+      result.splice(idx, h.oldLines, ...h.newLines);
+    }
+
+    fs.writeFileSync(fullPath, result.join('\n'), 'utf8');
+
+    const { randomUUID } = await import('node:crypto');
     context.blackboard.appendArtifact({
-      artifactId: `art_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      artifactId: `art_${randomUUID().slice(0, 8)}`,
       filePath: params.filePath,
       action: 'MODIFY',
-      diffContent: params.patch,
+      diffContent: params.patch.slice(0, 8000),
     });
 
-    return `Patch applied successfully to ${params.filePath}.`;
+    return `Patch applied successfully to ${params.filePath} (${hunks.length} hunk(s)).`;
+    });
   },
 };

@@ -40,8 +40,8 @@ export class BreakpointResumer {
       throw new Error('All milestones in DAG are already completed successfully. Nothing to resume.');
     }
 
-    // Reset status to READY
-    plan.resetFailedMilestone(target.id);
+    // Reset status to READY (cascade to downstream FAILED/BLOCKED so resume doesn't deadlock)
+    plan.resetFailedMilestone(target.id, { cascade: true });
 
     // Update plan in blackboard & emit event
     threadContext.setExecutionPlan(plan);

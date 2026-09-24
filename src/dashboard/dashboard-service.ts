@@ -267,12 +267,19 @@ export class DashboardService {
    */
   public static getDashboardSummary(requestedDb?: string): DashboardSummary {
     const dbPath = this.resolveDbPath(requestedDb);
+    let sizeBytes = 0;
+    let mtime = 0;
+    try {
+      const stat = fs.statSync(dbPath);
+      sizeBytes = stat.size;
+      mtime = stat.mtimeMs;
+    } catch {}
     const meta: DatabaseMeta = {
       name: path.basename(dbPath),
       filePath: dbPath,
-      sizeBytes: fs.existsSync(dbPath) ? fs.statSync(dbPath).size : 0,
-      sizeFormatted: fs.existsSync(dbPath) ? formatBytes(fs.statSync(dbPath).size) : '0 B',
-      mtime: fs.existsSync(dbPath) ? fs.statSync(dbPath).mtimeMs : 0,
+      sizeBytes,
+      sizeFormatted: formatBytes(sizeBytes),
+      mtime,
       isDefault: dbPath === getDefaultDbPath(),
     };
 
@@ -374,22 +381,31 @@ export class DashboardService {
 
   /**
    * Returns full session list with parent-child tree hierarchy.
+   * List view truncates prompts and caps rows to bound memory; use
+   * getSessionDetail for full per-session data.
    */
-  public static getSessionList(requestedDb?: string): SessionTreeItem[] {
+  public static getSessionList(
+    requestedDb?: string,
+    options: { limit?: number } = {}
+  ): SessionTreeItem[] {
     const dbPath = this.resolveDbPath(requestedDb);
     const db = this.openDb(dbPath);
     if (!db) return [];
 
+    const limit = Math.min(Math.max(options.limit ?? 2000, 1), 5000);
+
     try {
       const rows = db.prepare(`
         SELECT
-          thread_id, session_id, parent_thread_id, current_state, prompt, workspace_path,
+          thread_id, session_id, parent_thread_id, current_state,
+          SUBSTR(prompt, 1, 500) AS prompt, workspace_path,
           created_at, updated_at, completed_at, total_duration_ms,
           total_prompt_tokens, total_completion_tokens, total_tokens,
           total_turns, total_steps, error_message
         FROM threads
         ORDER BY created_at DESC
-      `).all() as any[];
+        LIMIT ?
+      `).all(limit) as any[];
 
       const itemMap = new Map<string, SessionTreeItem>();
       const rootItems: SessionTreeItem[] = [];
@@ -818,38 +834,67 @@ export class DashboardService {
 
   /**
    * Deletes a single session and all associated data, turns, steps, events, and artifacts.
+   * Descendants of any depth are collected via recursive CTE (no orphaned grandchildren),
+   * and all deletes run in one transaction.
    */
   public static deleteSession(requestedDb: string | undefined, sessionId: string): boolean {
     const dbPath = this.resolveDbPath(requestedDb);
     const db = this.openDb(dbPath);
     if (!db) return false;
     try {
-      db.exec('PRAGMA foreign_keys = OFF;');
       const mappedId = sessionId.startsWith('task_')
         ? sessionId.replace(/^task_/, 'session_')
         : (sessionId.startsWith('session_') ? sessionId.replace(/^session_/, 'task_') : sessionId);
 
-      const sessionRows = db.prepare(`
-        SELECT thread_id, session_id FROM threads
-        WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ? OR parent_thread_id = ? OR parent_thread_id = ?
-      `).all(sessionId, sessionId, mappedId, mappedId, sessionId, mappedId) as Array<{ thread_id: string; session_id?: string }>;
+      const seedRows = db.prepare(`
+        SELECT thread_id FROM threads
+        WHERE thread_id = ? OR session_id = ? OR thread_id = ? OR session_id = ?
+      `).all(sessionId, sessionId, mappedId, mappedId) as Array<{ thread_id: string }>;
+      const seeds = Array.from(new Set([sessionId, mappedId, ...seedRows.map((r) => r.thread_id)]));
 
-      const targetSessionIds = Array.from(new Set([sessionId, mappedId, ...sessionRows.map((r) => r.thread_id)]));
-
-      for (const sid of targetSessionIds) {
-        db.prepare('DELETE FROM turns WHERE thread_id = ?').run(sid);
-        db.prepare('DELETE FROM steps WHERE thread_id = ?').run(sid);
-        db.prepare('DELETE FROM task_events WHERE thread_id = ?').run(sid);
-        db.prepare('DELETE FROM blackboard_entries WHERE thread_id = ?').run(sid);
-        db.prepare('DELETE FROM artifacts WHERE thread_id = ?').run(sid);
-        db.prepare('DELETE FROM threads WHERE thread_id = ?').run(sid);
-      }
-
+      db.exec('PRAGMA foreign_keys = OFF;');
+      db.exec('BEGIN IMMEDIATE;');
       try {
-        db.prepare('DELETE FROM acp_sessions WHERE session_id = ? OR session_id = ?').run(sessionId, mappedId);
-      } catch {}
-
-      db.exec('PRAGMA foreign_keys = ON;');
+        const placeholders = seeds.map(() => '?').join(',');
+        // Recursive CTE: seeds + all descendants at any depth
+        const doomed = db.prepare(`
+          WITH RECURSIVE doomed(tid) AS (
+            SELECT thread_id FROM threads WHERE thread_id IN (${placeholders})
+            UNION
+            SELECT t.thread_id FROM threads t JOIN doomed d ON t.parent_thread_id = d.tid
+          )
+          SELECT tid FROM doomed
+        `).all(...seeds) as Array<{ tid: string }>;
+        const ids = Array.from(new Set(doomed.map((r) => r.tid)));
+        if (ids.length > 0) {
+          const inList = ids.map(() => '?').join(',');
+          const delTurns = db.prepare(`DELETE FROM turns WHERE thread_id IN (${inList})`);
+          const delSteps = db.prepare(`DELETE FROM steps WHERE thread_id IN (${inList})`);
+          const delEvents = db.prepare(`DELETE FROM task_events WHERE thread_id IN (${inList})`);
+          const delBb = db.prepare(`DELETE FROM blackboard_entries WHERE thread_id IN (${inList})`);
+          const delArt = db.prepare(`DELETE FROM artifacts WHERE thread_id IN (${inList})`);
+          const delThreads = db.prepare(`DELETE FROM threads WHERE thread_id IN (${inList})`);
+          delTurns.run(...ids);
+          delSteps.run(...ids);
+          delEvents.run(...ids);
+          delBb.run(...ids);
+          delArt.run(...ids);
+          delThreads.run(...ids);
+        }
+        try {
+          db.prepare('DELETE FROM acp_sessions WHERE session_id = ? OR session_id = ?').run(sessionId, mappedId);
+        } catch {}
+        db.exec('COMMIT;');
+      } catch (inner: any) {
+        try {
+          db.exec('ROLLBACK;');
+        } catch {}
+        throw inner;
+      } finally {
+        try {
+          db.exec('PRAGMA foreign_keys = ON;');
+        } catch {}
+      }
       return true;
     } catch (err) {
       console.error(`[DashboardService] Error deleting session ${sessionId}:`, err);
@@ -871,18 +916,31 @@ export class DashboardService {
     if (!db) return false;
     try {
       db.exec('PRAGMA foreign_keys = OFF;');
-      db.exec('DELETE FROM turns;');
-      db.exec('DELETE FROM steps;');
-      db.exec('DELETE FROM task_events;');
-      db.exec('DELETE FROM blackboard_entries;');
-      db.exec('DELETE FROM artifacts;');
-      db.exec('DELETE FROM threads;');
+      db.exec('BEGIN IMMEDIATE;');
       try {
-        db.exec('DELETE FROM acp_sessions;');
-      } catch {}
-      db.exec('PRAGMA foreign_keys = ON;');
+        db.exec('DELETE FROM turns;');
+        db.exec('DELETE FROM steps;');
+        db.exec('DELETE FROM task_events;');
+        db.exec('DELETE FROM blackboard_entries;');
+        db.exec('DELETE FROM artifacts;');
+        db.exec('DELETE FROM threads;');
+        try {
+          db.exec('DELETE FROM acp_sessions;');
+        } catch {}
+        db.exec('COMMIT;');
+      } catch (inner: any) {
+        try {
+          db.exec('ROLLBACK;');
+        } catch {}
+        throw inner;
+      } finally {
+        try {
+          db.exec('PRAGMA foreign_keys = ON;');
+        } catch {}
+      }
+      // Best-effort space reclaim without blocking writers; failures are non-fatal
       try {
-        db.exec('VACUUM;');
+        db.exec('PRAGMA incremental_vacuum;');
       } catch {}
       return true;
     } catch (err) {
@@ -897,31 +955,72 @@ export class DashboardService {
    * Exports full telemetry data of a database as JSON.
    */
   public static exportFullDatabaseJson(requestedDb?: string): any {
-    const summary = this.getDashboardSummary(requestedDb);
-    const sessions = this.getSessionList(requestedDb);
-    const detailedSessions: any[] = [];
-
-    for (const root of sessions) {
-      const detail = this.getSessionDetail(requestedDb, root.sessionId);
-      if (detail) {
-        detailedSessions.push(detail);
+    const details: any[] = [];
+    let firstPass = true;
+    const chunks: string[] = [];
+    this.streamDatabaseExport(
+      requestedDb,
+      (c) => chunks.push(c),
+      (detail) => {
+        if (firstPass) details.push(detail);
+      },
+      {
+        onPassEnd: () => {
+          firstPass = false;
+        },
       }
-      for (const child of root.children) {
-        const childDetail = this.getSessionDetail(requestedDb, child.sessionId);
-        if (childDetail) {
-          detailedSessions.push(childDetail);
-        }
-      }
-    }
-
+    );
     return {
       exportVersion: '1.0',
       exportedAt: new Date().toISOString(),
-      summary,
-      sessions: detailedSessions,
-      threads: detailedSessions,
+      summary: this.getDashboardSummary(requestedDb),
+      sessions: details,
+      threads: details,
     };
   }
+
+  /**
+   * Streaming export: writes JSON incrementally so only one session detail
+   * is resident at a time (no N+1 connection storm in memory, no 2x string).
+   * The optional onDetail hook receives each detail for non-streaming callers.
+   */
+  public static streamDatabaseExport(
+    requestedDb: string | undefined,
+    write: (chunk: string) => void,
+    onDetail?: (detail: any) => void,
+    options: { limit?: number; onPassEnd?: () => void } = {}
+  ): void {
+    const limit = Math.min(Math.max(options.limit ?? 500, 1), 5000);
+    const summary = this.getDashboardSummary(requestedDb);
+    const sessions = this.getSessionList(requestedDb, { limit });
+    const E = (v: any) => JSON.stringify(v);
+    const writeDetails = () => {
+      let first = true;
+      const emitDetail = (id: string) => {
+        const detail = this.getSessionDetail(requestedDb, id);
+        if (!detail) return;
+        if (!first) write(',');
+        first = false;
+        write(E(detail));
+        onDetail?.(detail);
+      };
+      for (const root of sessions) {
+        emitDetail(root.sessionId);
+        for (const child of root.children) emitDetail(child.sessionId);
+      }
+      options.onPassEnd?.();
+    };
+    write(`{"exportVersion":"1.0","exportedAt":${E(new Date().toISOString())},"summary":${E(summary)},"sessions":[`);
+    writeDetails();
+    // `threads` is a backwards-compat alias of `sessions`; re-iterate (2x reads, O(1) memory)
+    write(`],"threads":[`);
+    writeDetails();
+    write(`]}`);
+  }
+
+  // In-flight resume guard: same session can't resume twice concurrently
+  private static readonly resumeInflight = new Map<string, Promise<any>>();
+  private static readonly RESUME_TIMEOUT_MS = 120000;
 
   /**
    * Resumes a session (either with a follow-up prompt or continuing from checkpoint).
@@ -937,6 +1036,50 @@ export class DashboardService {
     }
 
     const targetSessionId = sessionId.startsWith('task_') ? sessionId.replace(/^task_/, 'session_') : sessionId;
+    const inflightKey = `${dbPath}:${targetSessionId}`;
+    const existing = this.resumeInflight.get(inflightKey);
+    if (existing) {
+      return {
+        success: false,
+        sessionId: targetSessionId,
+        message: 'A resume is already in flight for this session — wait for it to finish',
+      };
+    }
+
+    const run = this.resumeSessionInner(dbPath, targetSessionId, sessionId, options);
+    this.resumeInflight.set(inflightKey, run);
+    try {
+      return await run;
+    } finally {
+      if (this.resumeInflight.get(inflightKey) === run) {
+        this.resumeInflight.delete(inflightKey);
+      }
+    }
+  }
+
+  private static async resumeSessionInner(
+    dbPath: string,
+    targetSessionId: string,
+    sessionId: string,
+    options: { prompt?: string; mode?: 'continue' | 'checkpoint'; autoDiscoverProvider?: boolean }
+  ): Promise<{ success: boolean; sessionId: string; status?: string; message?: string; metrics?: any }> {
+    const withTimeout = async <T>(p: Promise<T>): Promise<T> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          p,
+          new Promise<T>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`Resume timed out after ${this.RESUME_TIMEOUT_MS}ms`)),
+              this.RESUME_TIMEOUT_MS
+            );
+            (timer as any)?.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
 
     try {
       const { createAgentRuntime } = await import('../index.js');
@@ -966,15 +1109,15 @@ export class DashboardService {
           if (!thread) {
             return { success: false, sessionId: targetSessionId, message: `Could not load session context for ${targetSessionId}` };
           }
-          const report = await runtime.runner.resumeTask(thread);
+          const report = await withTimeout(runtime.runner.resumeTask(thread));
           return { success: true, sessionId: targetSessionId, status: report.status, message: 'Resumed from checkpoint', metrics: report };
         } else {
           // Continue dialogue mode: send follow-up prompt to session
           const promptToSend = promptText || '请从之前中断的地方继续推进并汇报最新进展。';
-          const promptRes = await runtime.dispatcher.callMethod<any, any>('session/prompt', {
+          const promptRes = await withTimeout(runtime.dispatcher.callMethod<any, any>('session/prompt', {
             sessionId: targetSessionId,
             prompt: promptToSend,
-          });
+          }));
           return {
             success: promptRes.status === 'completed' || promptRes.status === 'blocked',
             sessionId: targetSessionId,

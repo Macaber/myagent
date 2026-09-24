@@ -45,40 +45,17 @@ export class VerificationGuard {
         try {
           const result = await this.toolRegistry.executeTool('bash', { command: cleanCommand }, context);
           if (result.error) {
-            if (
-              milestone.resultSummary &&
-              milestone.resultSummary.trim().length > 0 &&
-              (milestone.resultSummary.includes('PASSED') ||
-                milestone.resultSummary.includes('通过') ||
-                milestone.resultSummary.includes('成功'))
-            ) {
-              return {
-                passed: true,
-                message: `Milestone verified via worker summary: ${milestone.resultSummary.slice(0, 200)} (Acceptance cmd '${cleanCommand}' warning: ${result.error})`,
-              };
-            }
             return {
               passed: false,
               message: `Acceptance verification command '${cleanCommand}' failed: ${result.error}`,
             };
           }
+          const output = typeof result.output === 'string' ? result.output : String(result.output ?? '');
           return {
             passed: true,
-            message: `Acceptance verification command '${cleanCommand}' succeeded. Output:\n${result.output.slice(0, 500)}`,
+            message: `Acceptance verification command '${cleanCommand}' succeeded. Output:\n${output.slice(0, 500)}`,
           };
         } catch (err: any) {
-          if (
-            milestone.resultSummary &&
-            milestone.resultSummary.trim().length > 0 &&
-            (milestone.resultSummary.includes('PASSED') ||
-              milestone.resultSummary.includes('通过') ||
-              milestone.resultSummary.includes('成功'))
-          ) {
-            return {
-              passed: true,
-              message: `Milestone verified via worker summary: ${milestone.resultSummary.slice(0, 200)} (Acceptance cmd '${cleanCommand}' error: ${err.message})`,
-            };
-          }
           return {
             passed: false,
             message: `Acceptance verification command execution error: ${err.message}`,

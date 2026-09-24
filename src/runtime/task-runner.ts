@@ -10,6 +10,7 @@ import { ToolRegistry } from '../tools/tool-registry.js';
 
 export interface TaskRunnerConfig {
   maxTurns?: number;
+  maxParallelMilestones?: number;
 }
 
 export class TaskRunner {
@@ -28,6 +29,46 @@ export class TaskRunner {
 
     // 1. Create a single Turn for this user interaction / prompt
     const promptTurn = threadContext.createTurn('USER_INPUT');
+    let turnEnded = false;
+    const endTurnOnce = (params: { status: 'COMPLETED' | 'FAILED' | 'SUSPENDED'; summary?: string }) => {
+      if (turnEnded) return;
+      turnEnded = true;
+      try {
+        promptTurn.end(params);
+      } catch {
+        // Best-effort: telemetry end must not mask the real result.
+      }
+    };
+
+    try {
+      return await this.runTaskInner(threadContext, options, stateMachine, promptTurn, endTurnOnce);
+    } catch (err: any) {
+      if (options.abortSignal?.aborted) {
+        endTurnOnce({ status: 'FAILED', summary: 'Task cancelled by user' });
+        try {
+          stateMachine.transitionTo('CANCELLED');
+        } catch {}
+        return threadContext.cancel(err?.message || 'Task cancelled by user');
+      }
+      endTurnOnce({ status: 'FAILED', summary: err?.message || 'Execution failed' });
+      try {
+        stateMachine.transitionTo('FAILED');
+      } catch {}
+      // Preserve CANCELLED semantics if the error is an abort.
+      if (err?.name === 'AbortError') {
+        return threadContext.cancel(err?.message || 'Task cancelled by user');
+      }
+      return threadContext.fail(err?.message || 'Execution failed');
+    }
+  }
+
+  private async runTaskInner(
+    threadContext: ThreadContext,
+    options: { abortSignal?: AbortSignal; userHint?: string },
+    stateMachine: TaskStateMachine,
+    promptTurn: import('./turn-context.js').TurnContext,
+    endTurnOnce: (params: { status: 'COMPLETED' | 'FAILED' | 'SUSPENDED'; summary?: string }) => void
+  ): Promise<ThreadMetricsReport> {
 
     // 2. Planning Phase vs Direct Agent Loop
     let plan = threadContext.getExecutionPlan();
@@ -61,19 +102,20 @@ export class TaskRunner {
       });
 
       if (loopResult.status === 'CANCELLED') {
-        promptTurn.end({ status: 'FAILED', summary: 'Task cancelled by user' });
-        stateMachine.transitionTo('CANCELLED');
-        threadContext.setState('CANCELLED');
-        return threadContext.fail('Task cancelled by user');
+        endTurnOnce({ status: 'FAILED', summary: 'Task cancelled by user' });
+        try {
+          stateMachine.transitionTo('CANCELLED');
+        } catch {}
+        return threadContext.cancel('Task cancelled by user');
       }
 
       if (loopResult.status === 'FAILED') {
-        promptTurn.end({ status: 'FAILED', summary: loopResult.error || 'Execution failed' });
+        endTurnOnce({ status: 'FAILED', summary: loopResult.error || 'Execution failed' });
         stateMachine.transitionTo('FAILED');
         return threadContext.fail(loopResult.error || 'Execution failed');
       }
 
-      promptTurn.end({
+      endTurnOnce({
         status: 'COMPLETED',
         summary: loopResult.summary,
       });
@@ -105,11 +147,23 @@ export class TaskRunner {
           abortSignal: options.abortSignal,
         });
 
+        const validation = plan.validate();
+        if (!validation.valid) {
+          throw new Error(`Generated plan is invalid: ${validation.errors.join('; ')}`);
+        }
+
         threadContext.setExecutionPlan(plan);
       } catch (err: any) {
-        promptTurn.end({ status: 'FAILED', summary: err.message });
+        endTurnOnce({ status: 'FAILED', summary: err.message });
         stateMachine.transitionTo('FAILED');
         return threadContext.fail(`Planning phase failed: ${err.message}`);
+      }
+    } else {
+      const validation = plan.validate();
+      if (!validation.valid) {
+        endTurnOnce({ status: 'FAILED', summary: `Stored plan is invalid: ${validation.errors.join('; ')}` });
+        stateMachine.transitionTo('FAILED');
+        return threadContext.fail(`Stored plan is invalid: ${validation.errors.join('; ')}`);
       }
     }
 
@@ -121,15 +175,16 @@ export class TaskRunner {
     let lastSummary = '';
     while (!plan.isAllCompleted()) {
       if (options.abortSignal?.aborted) {
-        promptTurn.end({ status: 'FAILED', summary: 'Task cancelled by user' });
-        stateMachine.transitionTo('CANCELLED');
-        threadContext.setState('CANCELLED');
-        return threadContext.fail('Task cancelled by user');
+        endTurnOnce({ status: 'FAILED', summary: 'Task cancelled by user' });
+        try {
+          stateMachine.transitionTo('CANCELLED');
+        } catch {}
+        return threadContext.cancel('Task cancelled by user');
       }
 
       turnsCount++;
       if (turnsCount > (this.config.maxTurns || 50)) {
-        promptTurn.end({ status: 'FAILED', summary: `Max turn limit exceeded (${this.config.maxTurns})` });
+        endTurnOnce({ status: 'FAILED', summary: `Max turn limit exceeded (${this.config.maxTurns})` });
         stateMachine.transitionTo('FAILED');
         return threadContext.fail(`Max turn limit exceeded (${this.config.maxTurns})`);
       }
@@ -138,7 +193,7 @@ export class TaskRunner {
       if (readyMilestones.length === 0) {
         const blocked = plan.getFailedMilestones();
         if (blocked.length > 0) {
-          promptTurn.end({
+          endTurnOnce({
             status: 'FAILED',
             summary: `Task execution blocked: Milestones [${blocked.map((b) => b.id).join(', ')}] failed or require user intervention`,
           });
@@ -147,38 +202,77 @@ export class TaskRunner {
             `Task execution blocked: Milestones [${blocked.map((b) => b.id).join(', ')}] failed or require user intervention`
           );
         }
-        break;
+        // No ready and no failed, but incomplete => deadlock (missing dep / cycle).
+        // Must fail explicitly instead of breaking into a false COMPLETED.
+        const reason = plan.getBlockingReason();
+        endTurnOnce({ status: 'FAILED', summary: reason });
+        stateMachine.transitionTo('FAILED');
+        return threadContext.fail(reason);
       }
 
-      // Execute next milestone within this turn
-      const currentMilestone = readyMilestones[0];
-      currentMilestone.status = 'RUNNING';
+      // Execute ready milestones. Independent ready milestones run in a bounded
+      // parallel batch; single ready milestone keeps the legacy serial path.
+      const batchSize = Math.min(
+        readyMilestones.length,
+        (this.config.maxParallelMilestones ?? Number(process.env.MAX_PARALLEL_MILESTONES)) || 3
+      );
+      const batch = readyMilestones.slice(0, Math.max(batchSize, 1));
+      for (const m of batch) {
+        plan.markMilestoneStatus(m.id, 'RUNNING');
+      }
+      threadContext.persistExecutionPlan();
 
-      const workerResult = await this.worker.executeMilestone(
-        currentMilestone,
-        promptTurn,
-        {
-          threadId: threadContext.threadId,
-          prompt: threadContext.prompt,
-          turnId: promptTurn.turnId,
-          workspaceJail: threadContext.workspaceJail,
-          blackboard: threadContext.blackboard,
-          abortSignal: options.abortSignal,
-        },
-        options.userHint
+      const batchResults = await Promise.allSettled(
+        batch.map((m) =>
+          this.worker.executeMilestone(
+            m,
+            promptTurn,
+            {
+              threadId: threadContext.threadId,
+              prompt: threadContext.prompt,
+              turnId: promptTurn.turnId,
+              workspaceJail: threadContext.workspaceJail,
+              blackboard: threadContext.blackboard,
+              abortSignal: options.abortSignal,
+            },
+            options.userHint
+          ).then((r) => ({ milestoneId: m.id, result: r }))
+        )
       );
 
-      if (workerResult.summary) {
-        lastSummary = workerResult.summary;
+      // Collect batch outcomes; a rejected promise counts as FAILED (never orphans siblings).
+      let blockedOutcome: { milestoneId: string; result: import('../engine/worker.js').WorkerExecutionResult } | undefined;
+      let failedOutcome: { milestoneId: string; result: import('../engine/worker.js').WorkerExecutionResult } | undefined;
+      for (let i = 0; i < batchResults.length; i++) {
+        const settled = batchResults[i];
+        const mid = batch[i].id;
+        if (settled.status === 'fulfilled') {
+          const { result } = settled.value;
+          if (result.summary) lastSummary = result.summary;
+          if (result.status === 'SUCCESS') {
+            plan.markMilestoneStatus(mid, 'SUCCESS', result.summary);
+          } else if (result.status === 'BLOCKED') {
+            plan.markMilestoneStatus(mid, 'BLOCKED', result.summary, result.error);
+            blockedOutcome = blockedOutcome ?? { milestoneId: mid, result };
+          } else {
+            plan.markMilestoneStatus(mid, 'FAILED', result.summary, result.error);
+            failedOutcome = failedOutcome ?? { milestoneId: mid, result };
+          }
+        } else {
+          const errMsg = (settled.reason as Error)?.message || String(settled.reason);
+          plan.markMilestoneStatus(mid, 'FAILED', '', errMsg);
+          failedOutcome = failedOutcome ?? {
+            milestoneId: mid,
+            result: { status: 'FAILED', summary: '', error: errMsg },
+          };
+        }
       }
+      threadContext.persistExecutionPlan();
 
-      if (workerResult.status === 'SUCCESS') {
-        plan.markMilestoneStatus(currentMilestone.id, 'SUCCESS', workerResult.summary);
-      } else if (workerResult.status === 'BLOCKED') {
-        plan.markMilestoneStatus(currentMilestone.id, 'BLOCKED', workerResult.summary, workerResult.error);
-        promptTurn.end({
+      if (blockedOutcome) {
+        endTurnOnce({
           status: 'FAILED',
-          summary: `Milestone blocked: ${workerResult.error || workerResult.summary}`,
+          summary: `Milestone blocked: ${blockedOutcome.result.error || blockedOutcome.result.summary}`,
         });
 
         stateMachine.transitionTo('SUSPENDED_INPUT');
@@ -190,27 +284,28 @@ export class TaskRunner {
           type: 'BLOCKED_NEED_USER',
           timestamp: Date.now(),
           data: {
-            milestoneId: currentMilestone.id,
-            error: workerResult.error,
-            remedySuggestion: workerResult.remedySuggestion,
+            milestoneId: blockedOutcome.milestoneId,
+            error: blockedOutcome.result.error,
+            remedySuggestion: blockedOutcome.result.remedySuggestion,
           },
         });
 
         return threadContext.telemetryStore.getThreadMetrics(threadContext.threadId);
-      } else {
-        plan.markMilestoneStatus(currentMilestone.id, 'FAILED', workerResult.summary, workerResult.error);
-        promptTurn.end({
+      }
+      if (failedOutcome) {
+        endTurnOnce({
           status: 'FAILED',
-          summary: workerResult.error || 'Execution failed',
+          summary: failedOutcome.result.error || 'Execution failed',
         });
         stateMachine.transitionTo('FAILED');
-        return threadContext.fail(`Milestone '${currentMilestone.id}' failed: ${workerResult.error}`);
+        return threadContext.fail(`Milestone '${failedOutcome.milestoneId}' failed: ${failedOutcome.result.error}`);
       }
+      // Batch fully succeeded — continue to next ready set.
     }
 
     // 4. Summary & Completion
     const finalSummary = lastSummary || 'All milestones in DAG completed successfully.';
-    promptTurn.end({
+    endTurnOnce({
       status: 'COMPLETED',
       summary: finalSummary,
     });

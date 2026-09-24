@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { ThreadContext } from './thread-context.js';
 import { AgentDatabase } from '../persistence/db.js';
 import { RpcDispatcher } from '../protocol/rpc-dispatcher.js';
@@ -28,6 +29,10 @@ export interface SubagentExecutionResult {
 
 export class SubagentManager {
   private subagentCounter = 1;
+  private static readonly MAX_BATCH = 4;
+  private static readonly MAX_PARALLEL = 3;
+  private static readonly MAX_TASK_CHARS = 4000;
+  private static readonly MAX_STEPS_HARD = 20;
 
   constructor(
     private readonly db: AgentDatabase,
@@ -37,22 +42,107 @@ export class SubagentManager {
     private readonly dispatcher?: RpcDispatcher
   ) {}
 
+  private static isReadOnlyRole(role: string): boolean {
+    const r = (role || '').toLowerCase();
+    return r.includes('explore') || r.includes('research') || r.includes('analyst') || r.includes('search');
+  }
+
+  private static sanitizeParams(params: SpawnSubagentParams): SpawnSubagentParams {
+    const role = (params.role || 'analyst').slice(0, 64);
+    const taskDescription = (params.taskDescription || '').slice(0, SubagentManager.MAX_TASK_CHARS);
+    if (!taskDescription.trim()) {
+      throw new Error('invoke_subagent requires a non-empty taskDescription');
+    }
+    const maxSteps = Math.min(
+      Math.max(params.maxSteps ?? 10, 1),
+      SubagentManager.MAX_STEPS_HARD
+    );
+    return { role, taskDescription, skillId: params.skillId, maxSteps };
+  }
+
   /**
-   * Run multiple subagents concurrently in parallel via Promise.all.
-   * Isolates context completely across all subagent threads.
+   * Run multiple subagents with bounded concurrency.
+   * Read-only explorers run in parallel (≤3); writers run sequentially
+   * to avoid concurrent edits to the same workspace. Failures are
+   * collected as FAILED results (allSettled) so siblings are not orphaned.
    */
   public async runSubagentsBatch(
     parentThread: ThreadContext,
-    tasks: SpawnSubagentParams[]
+    tasks: SpawnSubagentParams[],
+    options: { abortSignal?: AbortSignal } = {}
   ): Promise<SubagentExecutionResult[]> {
     if (tasks.length === 0) return [];
-    if (tasks.length === 1) {
-      const single = await this.runSubagent(parentThread, tasks[0]);
+    // Depth guard: grandchild subagents are restricted to read-only, max 2.
+    const isNested = !!parentThread.parentThreadId;
+    let effectiveTasks = tasks.slice(0, SubagentManager.MAX_BATCH);
+    if (isNested) {
+      effectiveTasks = effectiveTasks
+        .filter((t) => SubagentManager.isReadOnlyRole(t.role))
+        .slice(0, 2);
+      if (effectiveTasks.length === 0) {
+        throw new Error('Nested subagents (depth > 2) are restricted to read-only explore tasks');
+      }
+    }
+    if (tasks.length === 1 && !isNested) {
+      const single = await this.runSubagent(parentThread, SubagentManager.sanitizeParams(tasks[0]), options);
       return [single];
     }
 
-    // Run all subagents concurrently in parallel via Promise.all
-    return Promise.all(tasks.map((task) => this.runSubagent(parentThread, task)));
+    const sanitized = effectiveTasks.map((t) => SubagentManager.sanitizeParams(t));
+    const readers = sanitized.filter((t) => SubagentManager.isReadOnlyRole(t.role));
+    const writers = sanitized.filter((t) => !SubagentManager.isReadOnlyRole(t.role));
+
+    const results: SubagentExecutionResult[] = [];
+    // Readers: bounded parallel pool
+    for (let i = 0; i < readers.length; i += SubagentManager.MAX_PARALLEL) {
+      const chunk = readers.slice(i, i + SubagentManager.MAX_PARALLEL);
+      const settled = await Promise.allSettled(
+        chunk.map((t) => this.runSubagent(parentThread, t, options))
+      );
+      for (let j = 0; j < settled.length; j++) {
+        const s = settled[j];
+        if (s.status === 'fulfilled') {
+          results.push(s.value);
+        } else {
+          results.push({
+            subagentId: `sub_failed_${Date.now()}_${j}`,
+            role: chunk[j].role,
+            status: 'FAILED',
+            summary: `Subagent crashed: ${(s.reason as Error)?.message || String(s.reason)}`,
+            durationMs: 0,
+            tokens: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          });
+        }
+      }
+      if (options.abortSignal?.aborted) break;
+    }
+    // Writers: sequential to avoid same-workspace file races
+    for (const t of writers) {
+      if (options.abortSignal?.aborted) {
+        results.push({
+          subagentId: `sub_aborted_${Date.now()}`,
+          role: t.role,
+          status: 'FAILED',
+          summary: 'Subagent batch aborted by client',
+          durationMs: 0,
+          tokens: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        });
+        break;
+      }
+      try {
+        results.push(await this.runSubagent(parentThread, t, options));
+      } catch (err: any) {
+        results.push({
+          subagentId: `sub_failed_${Date.now()}`,
+          role: t.role,
+          status: 'FAILED',
+          summary: `Subagent crashed: ${err?.message || String(err)}`,
+          durationMs: 0,
+          tokens: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        });
+      }
+    }
+    return results;
   }
 
   /**
@@ -80,16 +170,18 @@ export class SubagentManager {
 
   public async runSubagent(
     parentThread: ThreadContext,
-    params: SpawnSubagentParams
+    params: SpawnSubagentParams,
+    options: { abortSignal?: AbortSignal } = {}
   ): Promise<SubagentExecutionResult> {
-    const subagentId = `sub_${this.subagentCounter++}_${Date.now()}`;
+    const clean = SubagentManager.sanitizeParams(params);
+    const subagentId = `sub_${randomUUID().slice(0, 8)}_${Date.now().toString(36)}`;
     const childThreadId = `${parentThread.threadId}_${subagentId}`;
 
-    // 1. Resolve role, skill, and specialized prompt
-    const normalizedRole = (params.role || 'explore').toLowerCase();
-    let effectiveSkill = params.skillId;
+    // 1. Resolve role, skill, and specialized prompt (unknown roles default to read-only analyst)
+    const normalizedRole = (clean.role || 'analyst').toLowerCase();
+    let effectiveSkill = clean.skillId;
     let roleInstructions = '';
-    let defaultMaxSteps = 10;
+    let defaultMaxSteps = 8;
 
     if (!effectiveSkill) {
       if (
@@ -122,12 +214,15 @@ export class SubagentManager {
         roleInstructions =
           'You are a QA Subagent. Execute specified tests and report diagnostic outcomes and failure root causes.';
       } else {
-        effectiveSkill = 'developer';
-        defaultMaxSteps = 12;
+        effectiveSkill = 'analyst';
+        defaultMaxSteps = 8;
+        roleInstructions =
+          'You are an Analyst Subagent (Read-Only by default). Inspect and summarize only. ' +
+          'Do NOT modify files or run shell commands unless the task explicitly requires it.';
       }
     }
 
-    const effectiveMaxSteps = params.maxSteps ?? defaultMaxSteps;
+    const effectiveMaxSteps = Math.min(clean.maxSteps ?? defaultMaxSteps, SubagentManager.MAX_STEPS_HARD);
 
     // 2. Create Child Thread Context with parent link
     const childThread = new ThreadContext(
@@ -135,7 +230,7 @@ export class SubagentManager {
         threadId: childThreadId,
         sessionId: parentThread.sessionId,
         parentThreadId: parentThread.threadId,
-        prompt: `[Subagent: ${params.role}] ${params.taskDescription}`,
+        prompt: `[Subagent: ${clean.role}] ${clean.taskDescription}`,
         workspacePath: parentThread.workspaceJail.getWorkspaceRoot(),
       },
       this.db,
@@ -151,8 +246,8 @@ export class SubagentManager {
         event: 'subagent_started',
         subagentId,
         childThreadId,
-        role: params.role,
-        taskDescription: params.taskDescription,
+        role: clean.role,
+        taskDescription: clean.taskDescription,
       },
     });
 
@@ -161,8 +256,8 @@ export class SubagentManager {
 
     const syntheticMilestone = {
       id: subagentId,
-      title: `Subagent [${params.role}]`,
-      description: `${roleInstructions ? roleInstructions + '\n\n' : ''}Task: ${params.taskDescription}`,
+      title: `Subagent [${clean.role}]`,
+      description: `${roleInstructions ? roleInstructions + '\n\n' : ''}Task: ${clean.taskDescription}`,
       dependencies: [],
       assignedSkill: effectiveSkill,
       status: 'RUNNING' as const,
@@ -177,6 +272,7 @@ export class SubagentManager {
         turnId: subTurn.turnId,
         workspaceJail: childThread.workspaceJail,
         blackboard: childThread.blackboard,
+        abortSignal: options.abortSignal,
       },
       undefined,
       effectiveMaxSteps
@@ -187,15 +283,31 @@ export class SubagentManager {
       summary: workerResult.summary,
     });
 
-    const report = workerResult.status === 'SUCCESS'
-      ? childThread.complete(workerResult.summary)
-      : childThread.fail(workerResult.error || 'Subagent execution failed');
+    // Preserve BLOCKED semantics so the parent can suspend for user input
+    // instead of misreporting as FAILED.
+    let report;
+    if (workerResult.status === 'SUCCESS') {
+      report = childThread.complete(workerResult.summary);
+    } else if (workerResult.status === 'BLOCKED') {
+      childThread.setState('SUSPENDED_INPUT');
+      report = childThread.telemetryStore.getThreadMetrics(childThreadId);
+      try {
+        childThread.blackboard.set(`subagent_${subagentId}_blocked`, {
+          error: workerResult.error,
+          remedySuggestion: (workerResult as any).remedySuggestion,
+        });
+      } catch {}
+    } else {
+      report = childThread.fail(workerResult.error || 'Subagent execution failed');
+    }
 
     // 5. Store subagent outcome in Parent Blackboard for cross-agent coordination
     parentThread.blackboard.set(`subagent_${subagentId}`, {
-      role: params.role,
+      role: clean.role,
       status: workerResult.status,
       summary: workerResult.summary,
+      error: (workerResult as any).error,
+      remedySuggestion: (workerResult as any).remedySuggestion,
       tokens: report.totalTokens,
       durationMs: report.totalDurationMs,
     });
@@ -209,7 +321,7 @@ export class SubagentManager {
         event: 'subagent_finished',
         subagentId,
         childThreadId,
-        role: params.role,
+        role: clean.role,
         status: workerResult.status,
         durationMs: report.totalDurationMs,
         tokens: report.totalTokens,
@@ -219,7 +331,7 @@ export class SubagentManager {
 
     return {
       subagentId,
-      role: params.role,
+      role: clean.role,
       status: workerResult.status,
       summary: workerResult.summary,
       durationMs: report.totalDurationMs,

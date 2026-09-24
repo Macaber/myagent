@@ -36,6 +36,7 @@ export interface StreamDeltaChunk {
   type: 'content' | 'thought' | 'tool_call_delta' | 'usage' | 'done';
   deltaText?: string;
   thoughtText?: string;
+  finishReason?: string;
   toolCallDelta?: {
     index: number;
     id?: string;

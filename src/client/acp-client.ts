@@ -1,4 +1,3 @@
-import * as fs from 'node:fs/promises';
 import { AcpTransport } from '../protocol/transport.js';
 import {
   JsonRpcRequest,
@@ -388,7 +387,10 @@ export class AcpClient {
       const req = message as JsonRpcRequest;
 
       if (req.method === 'session/request_permission') {
+        let responded = false;
         const respond = (decision: PermissionDecision | string, reason?: string) => {
+          if (responded) return;
+          responded = true;
           const isAccept =
             decision === 'approved' ||
             decision === 'approved_once' ||
@@ -418,105 +420,121 @@ export class AcpClient {
         if (this.permissionListeners.size === 0) {
           respond('rejected', 'No approval handler registered');
         } else {
-          for (const listener of this.permissionListeners) {
-            listener(req.params as any, respond);
+          // First listener wins; extra listeners observe but must not double-respond.
+          const [first] = Array.from(this.permissionListeners);
+          try {
+            (first as any)(req.params as any, respond);
+          } catch (err: any) {
+            respond('rejected', err?.message || 'Permission handler error');
           }
         }
         return;
       }
 
+      // fs/* have no safe default: without a host handler, fail closed
+      // (never let the agent drive the client to read/write arbitrary paths).
       if (req.method === 'fs/read_text_file') {
         try {
-          const res = this.handlers.onReadTextFile
-            ? await this.handlers.onReadTextFile(req.params as ReadTextFileRequest)
-            : { content: await fs.readFile((req.params as any).path, 'utf8') };
+          if (!this.handlers.onReadTextFile) {
+            throw new Error('Client does not support fs/read_text_file');
+          }
+          const res = await this.handlers.onReadTextFile(req.params as ReadTextFileRequest);
           this.transport.send({ jsonrpc: '2.0', id: req.id, result: res });
         } catch (err: any) {
-          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32002, message: err.message } });
+          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: err.message } });
         }
         return;
       }
 
       if (req.method === 'fs/write_text_file') {
         try {
-          const res = this.handlers.onWriteTextFile
-            ? await this.handlers.onWriteTextFile(req.params as WriteTextFileRequest)
-            : (await fs.writeFile((req.params as any).path, (req.params as any).content, 'utf8'), {});
+          if (!this.handlers.onWriteTextFile) {
+            throw new Error('Client does not support fs/write_text_file');
+          }
+          const res = await this.handlers.onWriteTextFile(req.params as WriteTextFileRequest);
           this.transport.send({ jsonrpc: '2.0', id: req.id, result: res });
         } catch (err: any) {
-          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32603, message: err.message } });
+          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: err.message } });
         }
         return;
       }
 
+      // terminal/* have no safe default: fake success would make the agent
+      // believe commands ran. Fail closed instead.
       if (req.method === 'terminal/create') {
         try {
-          const res = this.handlers.onCreateTerminal
-            ? await this.handlers.onCreateTerminal(req.params as CreateTerminalRequest)
-            : { terminalId: `term_${Date.now()}` };
+          if (!this.handlers.onCreateTerminal) {
+            throw new Error('Client does not support terminal/create');
+          }
+          const res = await this.handlers.onCreateTerminal(req.params as CreateTerminalRequest);
           this.transport.send({ jsonrpc: '2.0', id: req.id, result: res });
         } catch (err: any) {
-          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32603, message: err.message } });
+          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: err.message } });
         }
         return;
       }
 
       if (req.method === 'terminal/output') {
         try {
-          const res = this.handlers.onTerminalOutput
-            ? await this.handlers.onTerminalOutput(req.params as TerminalOutputRequest)
-            : { output: '' };
+          if (!this.handlers.onTerminalOutput) {
+            throw new Error('Client does not support terminal/output');
+          }
+          const res = await this.handlers.onTerminalOutput(req.params as TerminalOutputRequest);
           this.transport.send({ jsonrpc: '2.0', id: req.id, result: res });
         } catch (err: any) {
-          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32603, message: err.message } });
+          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: err.message } });
         }
         return;
       }
 
       if (req.method === 'terminal/wait_for_exit') {
         try {
-          const res = this.handlers.onWaitForTerminalExit
-            ? await this.handlers.onWaitForTerminalExit(req.params as WaitForTerminalExitRequest)
-            : { exitCode: 0 };
+          if (!this.handlers.onWaitForTerminalExit) {
+            throw new Error('Client does not support terminal/wait_for_exit');
+          }
+          const res = await this.handlers.onWaitForTerminalExit(req.params as WaitForTerminalExitRequest);
           this.transport.send({ jsonrpc: '2.0', id: req.id, result: res });
         } catch (err: any) {
-          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32603, message: err.message } });
+          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: err.message } });
         }
         return;
       }
 
       if (req.method === 'terminal/kill') {
         try {
-          const res = this.handlers.onKillTerminal
-            ? await this.handlers.onKillTerminal(req.params as KillTerminalRequest)
-            : {};
+          if (!this.handlers.onKillTerminal) {
+            throw new Error('Client does not support terminal/kill');
+          }
+          const res = await this.handlers.onKillTerminal(req.params as KillTerminalRequest);
           this.transport.send({ jsonrpc: '2.0', id: req.id, result: res });
         } catch (err: any) {
-          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32603, message: err.message } });
+          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: err.message } });
         }
         return;
       }
 
       if (req.method === 'terminal/release') {
         try {
-          const res = this.handlers.onReleaseTerminal
-            ? await this.handlers.onReleaseTerminal(req.params as ReleaseTerminalRequest)
-            : {};
+          if (!this.handlers.onReleaseTerminal) {
+            throw new Error('Client does not support terminal/release');
+          }
+          const res = await this.handlers.onReleaseTerminal(req.params as ReleaseTerminalRequest);
           this.transport.send({ jsonrpc: '2.0', id: req.id, result: res });
         } catch (err: any) {
-          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32603, message: err.message } });
+          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: err.message } });
         }
         return;
       }
 
       if (req.method === 'elicitation/create') {
         try {
-          const res = this.handlers.onCreateElicitation
-            ? await this.handlers.onCreateElicitation(req.params as CreateElicitationRequest)
-            : { action: 'submit', values: {} };
+          if (!this.handlers.onCreateElicitation) {
+            throw new Error('Client does not support elicitation/create');
+          }
+          const res = await this.handlers.onCreateElicitation(req.params as CreateElicitationRequest);
           this.transport.send({ jsonrpc: '2.0', id: req.id, result: res });
         } catch (err: any) {
-          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32603, message: err.message } });
+          this.transport.send({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: err.message } });
         }
         return;
       }

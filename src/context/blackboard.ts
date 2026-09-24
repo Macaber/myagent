@@ -28,15 +28,23 @@ export class Blackboard {
   private inMemoryMilestones: MilestoneSummaryEntry[] = [];
   private totalBudget = 200000;
   private usedBudget = 0;
+  private budgetSeeded = false;
+  private version = 0;
 
   constructor(
     private readonly threadId: string = 'default_thread',
     private readonly db?: AgentDatabase
   ) {}
 
+  /** Monotonic version bumped on every mutation — drives L2 memoization. */
+  public getVersion(): number {
+    return this.version;
+  }
+
   public set<T = any>(key: string, value: T): void {
     if (!this.db) {
       this.inMemoryEntries.set(key, value);
+      this.version++;
       return;
     }
     const rawDb = this.db.getRawDb();
@@ -49,6 +57,7 @@ export class Blackboard {
         updated_at = excluded.updated_at
     `);
     stmt.run(this.threadId, key, JSON.stringify(value), now);
+    this.version++;
   }
 
   public get<T = any>(key: string): T | undefined {
@@ -72,6 +81,7 @@ export class Blackboard {
   public delete(key: string): void {
     if (!this.db) {
       this.inMemoryEntries.delete(key);
+      this.version++;
       return;
     }
     const rawDb = this.db.getRawDb();
@@ -80,6 +90,7 @@ export class Blackboard {
       WHERE thread_id = ? AND entry_key = ?
     `);
     stmt.run(this.threadId, key);
+    this.version++;
   }
 
   public listEntries(): Record<string, any> {
@@ -111,6 +122,10 @@ export class Blackboard {
 
     if (!this.db) {
       this.inMemoryArtifacts.push(fullEntry);
+      if (this.inMemoryArtifacts.length > 500) {
+        this.inMemoryArtifacts.splice(0, this.inMemoryArtifacts.length - 500);
+      }
+      this.version++;
       return;
     }
 
@@ -127,6 +142,15 @@ export class Blackboard {
       entry.diffContent ?? null,
       now
     );
+    // Cap growth: keep newest 500 per thread
+    try {
+      rawDb.prepare(`
+        DELETE FROM artifacts WHERE thread_id = ? AND artifact_id NOT IN (
+          SELECT artifact_id FROM artifacts WHERE thread_id = ? ORDER BY created_at DESC LIMIT 500
+        )
+      `).run(this.threadId, this.threadId);
+    } catch {}
+    this.version++;
   }
 
   public getArtifacts(): ArtifactEntry[] {
@@ -153,8 +177,32 @@ export class Blackboard {
   }
 
   public getModifiedFiles(): string[] {
-    const arts = this.getArtifacts();
-    return Array.from(new Set(arts.map((a) => a.filePath)));
+    if (!this.db) {
+      return Array.from(new Set(this.inMemoryArtifacts.map((a) => a.filePath)));
+    }
+    const rawDb = this.db.getRawDb();
+    const rows = rawDb.prepare(`
+      SELECT DISTINCT file_path FROM artifacts WHERE thread_id = ?
+    `).all(this.threadId) as any[];
+    return rows.map((r) => r.file_path);
+  }
+
+  /**
+   * Lightweight file ledger (path + last action) without pulling diff_content.
+   */
+  public getFileLedger(): Array<{ filePath: string; action: string }> {
+    if (!this.db) {
+      const last = new Map<string, string>();
+      for (const a of this.inMemoryArtifacts) last.set(a.filePath, a.action);
+      return Array.from(last.entries()).map(([filePath, action]) => ({ filePath, action }));
+    }
+    const rawDb = this.db.getRawDb();
+    const rows = rawDb.prepare(`
+      SELECT file_path, action FROM artifacts WHERE thread_id = ? ORDER BY created_at ASC
+    `).all(this.threadId) as any[];
+    const last = new Map<string, string>();
+    for (const r of rows) last.set(r.file_path, r.action);
+    return Array.from(last.entries()).map(([filePath, action]) => ({ filePath, action }));
   }
 
   // =================== Milestone Summaries (Compaction) ===================
@@ -174,8 +222,10 @@ export class Blackboard {
     };
     const summaries = this.getMilestoneSummaries();
     summaries.push(entry);
-    this.set('__milestone_summaries__', summaries);
-    this.inMemoryMilestones = summaries;
+    // Cap growth: keep newest 20 (older folded away by compaction)
+    const capped = summaries.length > 20 ? summaries.slice(summaries.length - 20) : summaries;
+    this.set('__milestone_summaries__', capped);
+    this.inMemoryMilestones = capped;
   }
 
   public getMilestoneSummaries(): MilestoneSummaryEntry[] {
@@ -190,8 +240,23 @@ export class Blackboard {
   }
 
   public recordTokenUsage(tokens: number): void {
+    // In-memory counter is the source of truth within a process (sync code
+    // can't interleave, so no race); lazily seeded from DB once to survive resume.
+    if (!this.db) {
+      this.usedBudget += tokens;
+      return;
+    }
+    if (!this.budgetSeeded) {
+      this.budgetSeeded = true;
+      const stored = this.get<number>('__used_budget__');
+      if (typeof stored === 'number' && stored > this.usedBudget) {
+        this.usedBudget = stored;
+      }
+    }
     this.usedBudget += tokens;
-    this.set('__used_budget__', this.usedBudget);
+    try {
+      this.set('__used_budget__', this.usedBudget);
+    } catch {}
   }
 
   public getTokenBudgetStatus(): { total: number; used: number; remaining: number } {

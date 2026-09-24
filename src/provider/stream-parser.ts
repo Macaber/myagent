@@ -24,13 +24,16 @@ export class StreamParser {
           const line = rawLine.trim();
           if (!line || line.startsWith(':')) continue; // Ignore comments/empty lines
 
-          if (line === 'data: [DONE]') {
+          if (line === 'data: [DONE]' || line === 'data:[DONE]') {
+            try {
+              await reader.cancel();
+            } catch {}
             yield { type: 'done' };
             return;
           }
 
-          if (line.startsWith('data: ')) {
-            const jsonStr = line.slice(6);
+          if (line.startsWith('data:')) {
+            const jsonStr = line.slice(5).trimStart();
             try {
               const data = JSON.parse(jsonStr);
 
@@ -46,11 +49,19 @@ export class StreamParser {
                 };
               }
 
-              // 2. Check delta choices
+              // 2. Check delta choices (fall back to `message` for non-streaming-compatible gateways)
               const choice = data.choices?.[0];
               if (!choice) continue;
 
-              const delta = choice.delta;
+              if (choice.finish_reason) {
+                yield {
+                  type: 'content',
+                  deltaText: '',
+                  finishReason: choice.finish_reason,
+                };
+              }
+
+              const delta = choice.delta ?? choice.message;
               if (!delta) continue;
 
               // Thought / reasoning delta (DeepSeek, etc.)
@@ -70,27 +81,31 @@ export class StreamParser {
                 };
               }
 
-              // Tool calls delta
+              // Tool calls delta (cap args at 256KB to bound malicious models)
               if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
                 for (const tc of delta.tool_calls) {
+                  const chunk = tc.function?.arguments;
                   yield {
                     type: 'tool_call_delta',
                     toolCallDelta: {
                       index: tc.index ?? 0,
                       id: tc.id,
                       name: tc.function?.name,
-                      argumentsChunk: tc.function?.arguments,
+                      argumentsChunk: typeof chunk === 'string' ? chunk.slice(0, 262144) : chunk,
                     },
                   };
                 }
               }
             } catch (err) {
-              console.warn('[StreamParser] Error parsing SSE data JSON:', jsonStr, err);
+              console.warn('[StreamParser] Error parsing SSE data JSON:', String(jsonStr).slice(0, 200));
             }
           }
         }
       }
     } finally {
+      try {
+        await reader.cancel();
+      } catch {}
       reader.releaseLock();
     }
   }
@@ -104,19 +119,28 @@ export class StreamParser {
     let fullContent = '';
     const toolCallsMap = new Map<number, { id: string; name: string; args: string }>();
     let usage: CompletionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let finishReason: string | undefined;
 
     for await (const chunk of generator) {
-      if (chunk.type === 'content' && chunk.deltaText) {
-        fullContent += chunk.deltaText;
+      if (chunk.type === 'content') {
+        if (chunk.deltaText) fullContent += chunk.deltaText;
+        if (chunk.finishReason) finishReason = chunk.finishReason;
       } else if (chunk.type === 'tool_call_delta' && chunk.toolCallDelta) {
         const { index, id, name, argumentsChunk } = chunk.toolCallDelta;
         const current = toolCallsMap.get(index) ?? { id: '', name: '', args: '' };
         if (id) current.id = id;
         if (name) current.name = name;
-        if (argumentsChunk) current.args += argumentsChunk;
+        if (argumentsChunk) {
+          current.args = (current.args + argumentsChunk).slice(0, 262144);
+        }
         toolCallsMap.set(index, current);
       } else if (chunk.type === 'usage' && chunk.usage) {
-        usage = chunk.usage;
+        // Accumulate across chunks (some gateways emit multiple usage frames)
+        usage = {
+          promptTokens: usage.promptTokens + (chunk.usage.promptTokens || 0),
+          completionTokens: usage.completionTokens + (chunk.usage.completionTokens || 0),
+          totalTokens: usage.totalTokens + (chunk.usage.totalTokens || 0),
+        };
       }
     }
 
@@ -135,6 +159,7 @@ export class StreamParser {
       content: fullContent.length > 0 ? fullContent : null,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       usage,
+      finishReason,
     };
   }
 }

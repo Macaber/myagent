@@ -18,6 +18,20 @@ export class AgentDatabase {
       }
     }
     this.db = new DatabaseSync(dbPath);
+    try {
+      this.db.exec(`PRAGMA journal_mode = WAL;`);
+    } catch {}
+    try {
+      this.db.exec(`PRAGMA busy_timeout = 5000;`);
+    } catch {}
+    try {
+      if (dbPath !== ':memory:') {
+        this.db.exec(`PRAGMA synchronous = NORMAL;`);
+      }
+    } catch {}
+    try {
+      this.db.exec(`PRAGMA foreign_keys = ON;`);
+    } catch {}
     this.initSchema();
   }
 
@@ -72,6 +86,11 @@ export class AgentDatabase {
         FOREIGN KEY(thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns(thread_id, turn_index);
+      CREATE INDEX IF NOT EXISTS idx_turns_status ON turns(thread_id, status);
+      CREATE INDEX IF NOT EXISTS idx_threads_parent ON threads(parent_thread_id);
+      CREATE INDEX IF NOT EXISTS idx_threads_state ON threads(current_state, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_threads_session ON threads(session_id);
+      CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at);
 
       -- 3. Steps
       CREATE TABLE IF NOT EXISTS steps (
@@ -95,6 +114,8 @@ export class AgentDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_steps_turn ON steps(turn_id, step_index);
       CREATE INDEX IF NOT EXISTS idx_steps_thread ON steps(thread_id, step_type);
+      CREATE INDEX IF NOT EXISTS idx_steps_status ON steps(thread_id, status);
+      CREATE INDEX IF NOT EXISTS idx_steps_tool ON steps(tool_name, step_type);
 
       -- 4. Event Sourcing Journal
       CREATE TABLE IF NOT EXISTS task_events (
@@ -108,6 +129,8 @@ export class AgentDatabase {
         FOREIGN KEY(thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_task_events ON task_events(thread_id, event_id);
+      CREATE INDEX IF NOT EXISTS idx_task_events_lookup ON task_events(turn_id, step_id);
+      CREATE INDEX IF NOT EXISTS idx_task_events_type ON task_events(event_type, created_at);
 
       -- 5. Blackboard Entries
       CREATE TABLE IF NOT EXISTS blackboard_entries (
@@ -127,6 +150,7 @@ export class AgentDatabase {
         diff_content TEXT,
         created_at INTEGER NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id, created_at);
 
         -- 7. ACP Sessions
         CREATE TABLE IF NOT EXISTS acp_sessions (
@@ -142,6 +166,7 @@ export class AgentDatabase {
           deleted INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_acp_sessions_cwd ON acp_sessions(cwd);
+        CREATE INDEX IF NOT EXISTS idx_acp_sessions_updated ON acp_sessions(updated_at);
 
         -- Canonical views for modern session abstraction
         CREATE VIEW IF NOT EXISTS sessions AS
@@ -203,35 +228,68 @@ export class AgentDatabase {
         FROM steps;
       `);
 
-      // Safe schema migration for existing databases
+      // Safe schema migration for existing databases (version-gated, no error-driven control flow)
       try {
-        this.db.exec(`ALTER TABLE acp_sessions ADD COLUMN history TEXT`);
-      } catch {}
-      try {
-        this.db.exec(`ALTER TABLE turns ADD COLUMN user_prompt TEXT`);
-      } catch {}
+        const vRow = this.db.prepare(`PRAGMA user_version`).get() as any;
+        const v = Number(vRow?.user_version || 0);
+        if (v < 1) {
+          this.db.exec(`ALTER TABLE acp_sessions ADD COLUMN history TEXT`);
+          this.db.exec(`ALTER TABLE turns ADD COLUMN user_prompt TEXT`);
+          this.db.exec(`PRAGMA user_version = 1`);
+        }
+      } catch {
+        try {
+          this.db.exec(`ALTER TABLE acp_sessions ADD COLUMN history TEXT`);
+        } catch {}
+        try {
+          this.db.exec(`ALTER TABLE turns ADD COLUMN user_prompt TEXT`);
+        } catch {}
+      }
 
-      // Auto-migrate legacy task_ thread IDs to canonical session_ IDs
+      // Auto-migrate legacy task_ thread IDs to canonical session_ IDs (single transaction)
       try {
-        this.db.exec('PRAGMA foreign_keys = OFF;');
         const legacyRows = this.db.prepare(
           "SELECT thread_id, session_id FROM threads WHERE thread_id LIKE 'task_%'"
         ).all() as Array<{ thread_id: string; session_id: string | null }>;
 
-        for (const row of legacyRows) {
-          const targetSessionId = (row.session_id && row.session_id.startsWith('session_'))
-            ? row.session_id
-            : row.thread_id.replace(/^task_/, 'session_');
+        if (legacyRows.length > 0) {
+          const stmtThreads = this.db.prepare('UPDATE threads SET thread_id = ?, session_id = ? WHERE thread_id = ?');
+          const stmtTurns = this.db.prepare('UPDATE turns SET thread_id = ? WHERE thread_id = ?');
+          const stmtSteps = this.db.prepare('UPDATE steps SET thread_id = ? WHERE thread_id = ?');
+          const stmtEvents = this.db.prepare('UPDATE task_events SET thread_id = ? WHERE thread_id = ?');
+          const stmtBb = this.db.prepare('UPDATE blackboard_entries SET thread_id = ? WHERE thread_id = ?');
+          const stmtArt = this.db.prepare('UPDATE artifacts SET thread_id = ? WHERE thread_id = ?');
+          const stmtParent = this.db.prepare('UPDATE threads SET parent_thread_id = ? WHERE parent_thread_id = ?');
+          // FK must be OFF while rewriting PKs; restore ON afterwards.
+          try {
+            this.db.exec('PRAGMA foreign_keys = OFF;');
+          } catch {}
+          this.db.exec('BEGIN IMMEDIATE;');
+          try {
+            for (const row of legacyRows) {
+              const targetSessionId = (row.session_id && row.session_id.startsWith('session_'))
+                ? row.session_id
+                : row.thread_id.replace(/^task_/, 'session_');
 
-          this.db.prepare('UPDATE threads SET thread_id = ?, session_id = ? WHERE thread_id = ?').run(targetSessionId, targetSessionId, row.thread_id);
-          this.db.prepare('UPDATE turns SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
-          this.db.prepare('UPDATE steps SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
-          this.db.prepare('UPDATE task_events SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
-          this.db.prepare('UPDATE blackboard_entries SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
-          this.db.prepare('UPDATE artifacts SET thread_id = ? WHERE thread_id = ?').run(targetSessionId, row.thread_id);
-          this.db.prepare('UPDATE threads SET parent_thread_id = ? WHERE parent_thread_id = ?').run(targetSessionId, row.thread_id);
+              stmtThreads.run(targetSessionId, targetSessionId, row.thread_id);
+              stmtTurns.run(targetSessionId, row.thread_id);
+              stmtSteps.run(targetSessionId, row.thread_id);
+              stmtEvents.run(targetSessionId, row.thread_id);
+              stmtBb.run(targetSessionId, row.thread_id);
+              stmtArt.run(targetSessionId, row.thread_id);
+              stmtParent.run(targetSessionId, row.thread_id);
+            }
+            this.db.exec('COMMIT;');
+          } catch (migErr) {
+            try {
+              this.db.exec('ROLLBACK;');
+            } catch {}
+            throw migErr;
+          }
         }
-        this.db.exec('PRAGMA foreign_keys = ON;');
+      } catch {}
+      try {
+        this.db.exec(`PRAGMA foreign_keys = ON;`);
       } catch {}
     }
 
@@ -316,15 +374,27 @@ export class AgentDatabase {
       });
     }
 
-    // 3. Synthesize from turns & steps
+    // 3. Synthesize from turns & steps (single batched steps query, no N+1)
     const turns = rawDb.prepare(
       'SELECT turn_id, turn_index, turn_type, status, summary FROM turns WHERE thread_id = ? ORDER BY turn_index ASC'
     ).all(thread.thread_id) as any[];
 
+    let stepsByTurn = new Map<string, any[]>();
+    if (turns.length > 0) {
+      const placeholders = turns.map(() => '?').join(',');
+      const turnIds = turns.map((t) => t.turn_id);
+      const allSteps = rawDb.prepare(
+        `SELECT step_id, turn_id, step_type, tool_name, status, error_message, metadata FROM steps WHERE turn_id IN (${placeholders}) ORDER BY turn_id, step_index ASC`
+      ).all(...turnIds) as any[];
+      for (const s of allSteps) {
+        const arr = stepsByTurn.get(s.turn_id);
+        if (arr) arr.push(s);
+        else stepsByTurn.set(s.turn_id, [s]);
+      }
+    }
+
     for (const turn of turns) {
-      const steps = rawDb.prepare(
-        'SELECT step_id, step_type, tool_name, status, error_message, metadata FROM steps WHERE turn_id = ? ORDER BY step_index ASC'
-      ).all(turn.turn_id) as any[];
+      const steps = stepsByTurn.get(turn.turn_id) || [];
 
       for (const step of steps) {
         if (step.step_type === 'TOOL_EXECUTION' && step.tool_name) {
@@ -369,7 +439,8 @@ export class AgentDatabase {
   }
 
   public listAcpSessions(cwd?: string, limit: number = 50, cursor?: string): { sessions: any[]; nextCursor?: string } {
-    let query = `SELECT * FROM acp_sessions WHERE deleted = 0`;
+    const safeLimit = Math.min(Math.max(Math.floor(limit) || 50, 1), 200);
+    let query = `SELECT session_id, cwd, title, created_at, updated_at FROM acp_sessions WHERE deleted = 0`;
     const params: any[] = [];
     if (cwd) {
       query += ` AND cwd = ?`;
@@ -383,16 +454,16 @@ export class AgentDatabase {
       }
     }
     query += ` ORDER BY updated_at DESC LIMIT ?`;
-    params.push(limit + 1);
+    params.push(safeLimit + 1);
 
     const stmt = this.db.prepare(query);
     const rows = stmt.all(...params) as any[];
 
     let nextCursor: string | undefined;
-    if (rows.length > limit) {
-      const last = rows[limit - 1];
+    if (rows.length > safeLimit) {
+      const last = rows[safeLimit - 1];
       nextCursor = String(last.updated_at);
-      rows.splice(limit);
+      rows.splice(safeLimit);
     }
 
     return {

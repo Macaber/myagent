@@ -14,8 +14,48 @@ export class PermissionDeniedByUserError extends Error {
 }
 
 export class ApprovalGate {
-  private alwaysApprovedTools = new Set<string>();
+  // Scoped by session + tool + args hash: one `allow_always bash(ls)` must not
+  // blanket-approve later `bash(rm -rf /)`. Entries expire after 1h.
+  private alwaysApproved = new Map<string, number>();
+  private static readonly ALWAYS_TTL_MS = 60 * 60 * 1000;
   private requestIdCounter = 1;
+
+  private static fnv1a(str: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16);
+  }
+
+  private approvalKey(params: {
+    threadId: string;
+    toolName: string;
+    command?: string;
+    filePath?: string;
+    metadata?: Record<string, any>;
+  }): string {
+    const cmd = params.command ?? '';
+    const file = params.filePath ?? '';
+    let meta = '';
+    try {
+      meta = JSON.stringify(params.metadata ?? {});
+    } catch {
+      meta = String(params.metadata);
+    }
+    return `${params.threadId}:${params.toolName}:${ApprovalGate.fnv1a(cmd + '|' + file + '|' + meta)}`;
+  }
+
+  private isAlwaysApproved(key: string): boolean {
+    const at = this.alwaysApproved.get(key);
+    if (at === undefined) return false;
+    if (Date.now() - at > ApprovalGate.ALWAYS_TTL_MS) {
+      this.alwaysApproved.delete(key);
+      return false;
+    }
+    return true;
+  }
 
   constructor(
     private readonly policyEngine: PolicyEngine,
@@ -33,8 +73,8 @@ export class ApprovalGate {
     command?: string;
     metadata?: Record<string, any>;
   }): Promise<void> {
-    // 1. Check if tool is permanently approved for this session
-    if (this.alwaysApprovedTools.has(params.toolName)) {
+    // 1. Check if this exact (session, tool, args) was permanently approved
+    if (this.isAlwaysApproved(this.approvalKey(params))) {
       return;
     }
 
@@ -118,17 +158,32 @@ export class ApprovalGate {
         : response.outcome?.outcome) ||
       response.decision ||
       '';
-    const decisionLower = String(outcome).toLowerCase();
+    const decision = String(outcome).trim().toLowerCase();
+    const isReject = decision === 'reject_once' || decision === 'reject_always'
+      || decision === 'rejected' || decision === 'cancelled' || decision === 'cancel'
+      || decision === 'decline' || decision === 'declined';
+    const isAlways = decision === 'allow_always' || decision === 'approved_always' || decision === 'always';
+    const isOnce = decision === 'allow_once' || decision === 'approved_once' || decision === 'approved'
+      || decision === 'accept' || decision === 'accepted';
 
-    if (decisionLower.includes('reject') || decisionLower.includes('cancel')) {
+    if (isReject) {
       throw new PermissionDeniedByUserError(
         params.toolName,
         response.reason || 'Operation rejected by user'
       );
     }
 
-    if (decisionLower.includes('always')) {
-      this.alwaysApprovedTools.add(params.toolName);
+    if (isAlways) {
+      this.alwaysApproved.set(this.approvalKey(params), Date.now());
+      return;
+    }
+
+    if (!isOnce) {
+      // Unknown outcome — fail closed rather than treating as approval.
+      throw new PermissionDeniedByUserError(
+        params.toolName,
+        `Unknown permission outcome '${outcome}' — treating as rejection`
+      );
     }
   }
 }

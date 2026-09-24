@@ -13,12 +13,42 @@ export class MemoryCompactor {
   private readonly headChars: number;
   private readonly tailChars: number;
   private readonly logDir?: string;
+  private static readonly MAX_LOG_BYTES = 100 * 1024 * 1024;
+  private static readonly MAX_LOG_FILES = 200;
 
   constructor(config: TruncationConfig = {}) {
     this.maxChars = config.maxCharacters ?? 4000;
     this.headChars = config.headCharacters ?? 1200;
     this.tailChars = config.tailCharacters ?? 1200;
     this.logDir = config.logDir;
+  }
+
+  private pruneLogDir(): void {
+    if (!this.logDir) return;
+    try {
+      const files = fs.readdirSync(this.logDir)
+        .map((n) => {
+          const p = path.join(this.logDir!, n);
+          try {
+            const s = fs.statSync(p);
+            return { p, mtime: s.mtimeMs, size: s.size };
+          } catch {
+            return null;
+          }
+        })
+        .filter((f): f is { p: string; mtime: number; size: number } => f !== null)
+        .sort((a, b) => a.mtime - b.mtime);
+      let total = files.reduce((acc, f) => acc + f.size, 0);
+      let count = files.length;
+      for (const f of files) {
+        if (total <= MemoryCompactor.MAX_LOG_BYTES && count <= MemoryCompactor.MAX_LOG_FILES) break;
+        try {
+          fs.unlinkSync(f.p);
+          total -= f.size;
+          count--;
+        } catch {}
+      }
+    } catch {}
   }
 
   public truncateToolOutput(
@@ -35,9 +65,12 @@ export class MemoryCompactor {
         if (!fs.existsSync(this.logDir)) {
           fs.mkdirSync(this.logDir, { recursive: true });
         }
-        const fileName = `tool_${contextInfo?.toolName || 'unknown'}_${Date.now()}.log`;
+        const safeTool = (contextInfo?.toolName || 'unknown').replace(/[^a-z0-9_-]/gi, '_').slice(0, 32);
+        const uniq = `${Date.now().toString(36)}${Math.floor(Math.random() * 0xffffff).toString(36)}`;
+        const fileName = `tool_${safeTool}_${uniq}.log`;
         fullLogPath = path.join(this.logDir, fileName);
         fs.writeFileSync(fullLogPath, output, 'utf8');
+        this.pruneLogDir();
       } catch (err) {
         console.warn('[MemoryCompactor] Failed to write full log to disk:', err);
       }

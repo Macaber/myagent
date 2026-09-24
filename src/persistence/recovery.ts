@@ -43,34 +43,46 @@ export class RecoveryManager {
     const rawDb = this.db.getRawDb();
     const now = Date.now();
 
-    // 1. Find any Step that was in 'RUNNING' status when crash occurred
-    rawDb.prepare(`
-      UPDATE steps
-      SET status = 'FAILED', error_message = 'Process crashed or terminated unexpectedly during step execution',
-          completed_at = ?, duration_ms = ? - started_at
-      WHERE thread_id = ? AND status = 'RUNNING'
-    `).run(now, now, threadId);
+    rawDb.exec('BEGIN IMMEDIATE;');
+    try {
+      // 1. Find any Step that was in 'RUNNING' status when crash occurred
+      // (clock-guard: duration never negative)
+      rawDb.prepare(`
+        UPDATE steps
+        SET status = 'FAILED', error_message = 'Process crashed or terminated unexpectedly during step execution',
+            completed_at = ?, duration_ms = MAX(0, ? - started_at)
+        WHERE thread_id = ? AND status = 'RUNNING'
+      `).run(now, now, threadId);
 
-    // 2. Find any Turn that was 'RUNNING'
-    rawDb.prepare(`
-      UPDATE turns
-      SET status = 'SUSPENDED', completed_at = ?, duration_ms = ? - started_at
-      WHERE thread_id = ? AND status = 'RUNNING'
-    `).run(now, now, threadId);
+      // 2. Find any Turn that was 'RUNNING'
+      rawDb.prepare(`
+        UPDATE turns
+        SET status = 'SUSPENDED', completed_at = ?, duration_ms = MAX(0, ? - started_at)
+        WHERE thread_id = ? AND status = 'RUNNING'
+      `).run(now, now, threadId);
 
-    // 3. Mark Thread state as SUSPENDED_INPUT or PENDING so it can be resumed
-    rawDb.prepare(`
-      UPDATE threads
-      SET current_state = 'SUSPENDED_INPUT', updated_at = ?
-      WHERE thread_id = ? AND current_state IN ('RUNNING', 'PLANNING')
-    `).run(now, threadId);
+      // 3. Mark Thread so it can be resumed (covers every unfinished state
+      // listed by getUnfinishedThreads, not just RUNNING/PLANNING)
+      rawDb.prepare(`
+        UPDATE threads
+        SET current_state = 'SUSPENDED_INPUT', updated_at = ?
+        WHERE thread_id = ? AND current_state IN ('PENDING', 'PLANNING', 'RUNNING', 'SUSPENDED_APPROVAL', 'SUSPENDED_INPUT')
+      `).run(now, threadId);
 
-    // 4. Log crash recovery event
-    this.eventStore.appendEvent({
-      threadId,
-      eventType: 'CRASH_RECOVERED',
-      payload: { recoveredAt: now, message: 'Cleaned up orphan running steps/turns' },
-      createdAt: now,
-    });
+      // 4. Log crash recovery event
+      this.eventStore.appendEvent({
+        threadId,
+        eventType: 'CRASH_RECOVERED',
+        payload: { recoveredAt: now, message: 'Cleaned up orphan running steps/turns' },
+        createdAt: now,
+      });
+
+      rawDb.exec('COMMIT;');
+    } catch (err) {
+      try {
+        rawDb.exec('ROLLBACK;');
+      } catch {}
+      throw err;
+    }
   }
 }
